@@ -9,6 +9,7 @@ from datetime import datetime
 
 from telegram import Update, BotCommand
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -28,10 +29,14 @@ BOT_TOKEN  = os.environ["BOT_TOKEN"]
 ADMIN_ID   = int(os.environ["ADMIN_ID"])
 CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 
+# Silenciar logs de httpx (cada request HTTP de Telegram) — reduce ruido y CPU
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Updater").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ── Estados del ConversationHandler ──────────────────────────────────────────
@@ -69,17 +74,26 @@ async def safe_send(context, chat_id: int, text: str, **kwargs) -> None:
         logger.warning("send_message failed to %s: %s", chat_id, e)
 
 
+async def safe_edit(query, text: str, **kwargs) -> None:
+    """Edita un mensaje ignorando el error 'message is not modified'."""
+    try:
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, **kwargs)
+    except BadRequest as e:
+        if "not modified" in str(e).lower():
+            pass  # El usuario pulsó el mismo botón dos veces — ignorar
+        else:
+            raise
+
+
 async def show_user_menu(update: Update, user_id: int, edit: bool = False) -> None:
     """Muestra el menú principal del usuario (nuevo mensaje o edita el actual)."""
     sub = db.get_active_subscription(user_id)
     has_sub = sub is not None
-    text = msg.menu_user_active(sub["expires_at"]) if has_sub else msg.menu_user_no_sub()
+    text   = msg.menu_user_active(sub["expires_at"]) if has_sub else msg.menu_user_no_sub()
     markup = kb.user_main_menu(has_sub)
 
     if edit and update.callback_query:
-        await update.callback_query.edit_message_text(
-            text, parse_mode=ParseMode.MARKDOWN, reply_markup=markup
-        )
+        await safe_edit(update.callback_query, text, reply_markup=markup)
     else:
         target = update.message or (update.callback_query.message if update.callback_query else None)
         if target:
@@ -110,16 +124,14 @@ async def user_activate_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     user_id = update.effective_user.id
     existing = db.get_active_subscription(user_id)
     if existing:
-        await query.edit_message_text(
+        await safe_edit(query,
             msg.err_already_active(existing["expires_at"]),
-            parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb.user_main_menu(has_sub=True),
         )
         return ConversationHandler.END
 
-    await query.edit_message_text(
+    await safe_edit(query,
         msg.ask_for_code("activate"),
-        parse_mode=ParseMode.MARKDOWN,
         reply_markup=kb.user_cancel(),
     )
     return S_WAITING_ACTIVATE_CODE
@@ -199,16 +211,14 @@ async def user_renew_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
 
     if not db.get_active_subscription(update.effective_user.id):
-        await query.edit_message_text(
+        await safe_edit(query,
             msg.err_no_sub_to_renew(),
-            parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb.user_main_menu(has_sub=False),
         )
         return ConversationHandler.END
 
-    await query.edit_message_text(
+    await safe_edit(query,
         msg.ask_for_code("renew"),
-        parse_mode=ParseMode.MARKDOWN,
         reply_markup=kb.user_cancel(),
     )
     return S_WAITING_RENEW_CODE
@@ -290,15 +300,13 @@ async def user_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif data == "u:status":
         sub = db.get_active_subscription(uid)
         if not sub:
-            await query.edit_message_text(
+            await safe_edit(query,
                 msg.status_no_sub(),
-                parse_mode=ParseMode.MARKDOWN,
                 reply_markup=kb.user_main_menu(has_sub=False),
             )
         else:
-            await query.edit_message_text(
+            await safe_edit(query,
                 msg.menu_user_active(sub["expires_at"]),
-                parse_mode=ParseMode.MARKDOWN,
                 reply_markup=kb.user_status_buttons(),
             )
 
@@ -326,9 +334,8 @@ async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def admin_gen_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text(
+    await safe_edit(query,
         msg.admin_ask_code_data(),
-        parse_mode=ParseMode.MARKDOWN,
         reply_markup=kb.admin_cancel(),
     )
     return S_ADMIN_WAITING_GEN
@@ -387,9 +394,8 @@ async def admin_gen_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def admin_deact_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text(
+    await safe_edit(query,
         msg.admin_ask_deactivate(),
-        parse_mode=ParseMode.MARKDOWN,
         reply_markup=kb.admin_cancel(),
     )
     return S_ADMIN_WAITING_DEACT
@@ -431,47 +437,42 @@ async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data
 
     if not is_admin(uid):
-        await query.edit_message_text("🚫 Sin permisos.")
+        await safe_edit(query, "🚫 Sin permisos.")
         return
 
     if data in ("a:menu", "a:refresh"):
-        await query.edit_message_text(
+        await safe_edit(query,
             msg.admin_menu(),
-            parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb.admin_main_menu(),
         )
 
     elif data == "a:stats":
-        await query.edit_message_text(
+        await safe_edit(query,
             msg.admin_stats(db.get_stats()),
-            parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb.admin_back(),
         )
 
     elif data == "a:list":
         codes = db.list_codes(only_active=True)
-        await query.edit_message_text(
+        await safe_edit(query,
             msg.admin_codes_list(codes),
-            parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb.admin_back(),
         )
 
     elif data == "a:users":
         s = db.get_stats()
-        await query.edit_message_text(
+        await safe_edit(query,
             f"👥 *Usuarios activos:* `{s['active_users']}`\n"
             f"⚠️ *Vencen en ≤3d:*   `{s['expiring_soon']}`\n"
             f"📈 *Activaciones hoy:* `{s['uses_today']}`",
-            parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb.admin_back(),
         )
 
     elif data.startswith("a:deact_ok:"):
         code = data.split(":", 2)[2]
         db.deactivate_code(code)
-        await query.edit_message_text(
+        await safe_edit(query,
             msg.admin_deactivated(code),
-            parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb.admin_back(),
         )
 
@@ -652,7 +653,10 @@ def main() -> None:
     )
 
     logger.info("🤖 Bot v3 iniciado — 100%% botones")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,   # evita conflicto con instancia anterior
+    )
 
 
 if __name__ == "__main__":
