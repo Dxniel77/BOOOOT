@@ -1,86 +1,49 @@
 """
-keyboards.py — Todos los teclados inline del bot.
+keyboards.py — Todos los teclados inline del bot
 """
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-# ══════════════════════════════════════════════
-#  MENÚ PRINCIPAL DE USUARIO
-# ══════════════════════════════════════════════
-
-def user_main_menu(has_sub: bool = False) -> InlineKeyboardMarkup:
-    """Menú principal: 3 botones siempre visibles, Renovar solo si hay suscripción."""
-    rows = [
-        [InlineKeyboardButton("🔑 Activar código",   callback_data="u:activate_start")],
-        [InlineKeyboardButton("📊 Ver mi suscripción", callback_data="u:status")],
-    ]
-    if has_sub:
-        rows.append([InlineKeyboardButton("🔄 Renovar suscripción", callback_data="u:renew_start")])
-    return InlineKeyboardMarkup(rows)
-
-
-def user_cancel() -> InlineKeyboardMarkup:
+def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancelar", callback_data="u:cancel")]
+        [InlineKeyboardButton("🔑 Activar código",    callback_data="activate")],
+        [InlineKeyboardButton("📊 Mi suscripción",    callback_data="my_sub")],
+        [InlineKeyboardButton("🔄 Renovar",           callback_data="renew")],
+        [InlineKeyboardButton("📞 Contactar admin",   callback_data="contact_admin")],
     ])
 
 
-def user_after_success(has_sub: bool = True) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("📊 Ver mi suscripción", callback_data="u:status")],
-        [InlineKeyboardButton("🏠 Menú principal",     callback_data="u:menu")],
-    ]
-    if has_sub:
-        rows.insert(1, [InlineKeyboardButton("🔄 Renovar suscripción", callback_data="u:renew_start")])
-    return InlineKeyboardMarkup(rows)
-
-
-def user_status_buttons() -> InlineKeyboardMarkup:
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Renovar suscripción", callback_data="u:renew_start")],
-        [InlineKeyboardButton("🏠 Menú principal",      callback_data="u:menu")],
+        [InlineKeyboardButton("🔑 Generar código",     callback_data="admin_gen_code")],
+        [InlineKeyboardButton("🗂️ Listar códigos",    callback_data="admin_list_codes")],
+        [InlineKeyboardButton("📊 Estadísticas",       callback_data="admin_stats")],
+        [InlineKeyboardButton("👥 Usuarios activos",   callback_data="admin_users")],
+        [InlineKeyboardButton("🔴 Desactivar código",  callback_data="admin_deactivate")],
+        [InlineKeyboardButton("🔄 Actualizar",         callback_data="admin_refresh")],
     ])
 
 
-# ══════════════════════════════════════════════
-#  PANEL ADMIN
-# ══════════════════════════════════════════════
-
-def admin_main_menu() -> InlineKeyboardMarkup:
+def back_to_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔑 Generar código",    callback_data="a:gen_start"),
-            InlineKeyboardButton("🗂️ Listar códigos",    callback_data="a:list"),
-        ],
-        [
-            InlineKeyboardButton("📊 Estadísticas",      callback_data="a:stats"),
-            InlineKeyboardButton("👥 Usuarios activos",  callback_data="a:users"),
-        ],
-        [
-            InlineKeyboardButton("🔴 Desactivar código", callback_data="a:deact_start"),
-        ],
-        [
-            InlineKeyboardButton("🔄 Actualizar",        callback_data="a:refresh"),
-        ],
+        [InlineKeyboardButton("🏠 Menú principal", callback_data="main_menu")]
     ])
 
 
-def admin_back() -> InlineKeyboardMarkup:
+def back_to_admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("◀️ Volver al panel", callback_data="a:menu")]
+        [InlineKeyboardButton("◀️ Volver al panel", callback_data="admin_back")]
     ])
 
 
-def admin_cancel() -> InlineKeyboardMarkup:
+def confirm_deactivate_keyboard(code: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancelar", callback_data="a:menu")]
+        [InlineKeyboardButton("✅ Confirmar",  callback_data=f"admin_confirm_deactivate:{code}")],
+        [InlineKeyboardButton("❌ Cancelar",   callback_data="admin_back")],
     ])
 
 
-def admin_confirm_deactivate(code: str) -> InlineKeyboardMarkup:
+def renew_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Sí, desactivar",  callback_data=f"a:deact_ok:{code}"),
-            InlineKeyboardButton("❌ Cancelar",         callback_data="a:menu"),
-        ]
+        [InlineKeyboardButton("🏠 Menú principal", callback_data="main_menu")]
     ])
