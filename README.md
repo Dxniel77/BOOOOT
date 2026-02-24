@@ -1,68 +1,95 @@
-# 🤖 Bot de Suscripción por Códigos — Telegram
+# 🤖 Bot de Suscripción v3 — 100% Botones
 
-## Variables de entorno en Railway
-
-| Variable     | Descripción                                          |
-|--------------|------------------------------------------------------|
-| `BOT_TOKEN`  | Token de tu bot (de @BotFather)                      |
-| `ADMIN_ID`   | Tu user ID de Telegram (número entero)               |
-| `CHANNEL_ID` | ID del canal privado (ej: `-1001234567890`)          |
-
-> Para obtener el CHANNEL_ID: añade @userinfobot a tu canal y escribe cualquier mensaje.
+Bot profesional de acceso a canales privados de Telegram.
+Interfaz completamente guiada por botones — sin comandos para los usuarios.
 
 ---
 
-## Comandos ADMIN
+## ✨ Flujo del usuario (sin comandos)
 
-| Comando | Descripción |
-|---------|-------------|
-| `/generar` | Código random, 30 días, 1 uso |
-| `/generar 60` | Código random, 60 días, 1 uso |
-| `/generar 30 5` | Código random, 30 días, 5 usos |
-| `/generar JUAN-VIP` | Código personalizado, 30 días, 1 uso |
-| `/generar JUAN-VIP 30` | Código personalizado, 30 días, 1 uso |
-| `/generar JUAN-VIP 30 5` | Código personalizado, 30 días, 5 usos |
-| `/listar` | Ver todos los códigos creados |
-| `/revocar CODIGO` | Desactiva el código y expulsa a sus usuarios |
-| `/usuarios` | Ver todos los suscriptores activos |
-| `/expulsar USER_ID` | Expulsar manualmente a un usuario |
-
-## Comandos USUARIO
-
-| Comando | Descripción |
-|---------|-------------|
-| `/start` | Mensaje de bienvenida |
-| `/activar CODIGO` | Activar suscripción con un código |
-| `/mi_suscripcion` | Ver estado y fecha de vencimiento |
-
----
-
-## Configuración del canal privado
-
-1. Crea un canal privado en Telegram.
-2. **Añade tu bot como administrador** del canal con permisos para:
-   - Invitar usuarios
-   - Expulsar usuarios
-3. Asegúrate de que el canal esté en modo **privado** (sin link público).
-
----
-
-## Deploy en Railway
-
-```bash
-# 1. Sube estos archivos a un repositorio GitHub
-# 2. Conecta el repo en railway.app
-# 3. Agrega las 3 variables de entorno
-# 4. Deploy → usa "worker" como proceso (ya configurado en Procfile)
+```
+/start
+  └─► Menú principal  ──► [🔑 Activar código]  ──► escribe código ──► ✅ acceso + link
+                       ──► [📊 Mi suscripción] ──► estado con barra de progreso
+                       ──► [🔄 Renovar]         ──► escribe código ──► ✅ renovado
+                       ──► [📞 Contactar admin] ──► link directo al admin
 ```
 
-**IMPORTANTE:** Si Railway falla con errores de versión, ve a:
-`Settings → Deploy → Clear Build Cache` y redespliega.
+---
+
+## 🛡️ Panel Admin (botones)
+
+```
+/admin
+  └─► Panel  ──► [🔑 Generar código]    ──► escribe "CODIGO DIAS USOS" ──► ✅ creado
+             ──► [🗂️ Listar códigos]   ──► tabla de todos los activos
+             ──► [📊 Estadísticas]      ──► métricas en tiempo real
+             ──► [👥 Usuarios activos]  ──► conteo + por vencer
+             ──► [🔴 Desactivar código] ──► escribe código ──► confirma ──► ✅
+             ──► [🔄 Actualizar]        ──► refresca el panel
+```
 
 ---
 
-## Cómo funciona internamente
+## 🚀 Deploy en Railway (Plan Free)
 
-- Los datos se guardan en `data.json` (en Railway persiste mientras el servicio corra).
-- Cada hora el bot revisa automáticamente si alguna suscripción venció y expulsa al usuario.
-- Los links de invitación son de **un solo uso** y expiran junto con la suscripción.
+### Variables de entorno
+
+```
+BOT_TOKEN   = token de BotFather
+ADMIN_ID    = tu ID de Telegram (número)
+CHANNEL_ID  = -1001234567890  (ID negativo del canal privado)
+DB_DIR      = /data
+```
+
+> **¿Cómo obtener tu ADMIN_ID?** Escríbele a [@userinfobot](https://t.me/userinfobot)
+> **¿Cómo obtener el CHANNEL_ID?** Reenvía un mensaje del canal al mismo bot
+
+### Volumen persistente (CRÍTICO para no perder datos)
+
+Railway → tu servicio → **Volumes** → **Add Volume** → Mount path: `/data`
+
+### Subir a GitHub
+
+```bash
+git init && git add . && git commit -m "bot v3"
+git remote add origin https://github.com/TU_USUARIO/TU_REPO.git
+git push -u origin main
+```
+
+Luego en Railway: **New Project → Deploy from GitHub repo**
+
+---
+
+## ⚙️ El bot debe ser admin del canal
+
+En el canal → Administradores → agregar el bot con permisos:
+- ✅ Invitar usuarios mediante enlace
+- ✅ Expulsar miembros
+
+---
+
+## 🗂️ Estructura
+
+```
+telegram-bot/
+├── bot.py          # Lógica, handlers, ConversationHandlers, jobs
+├── database.py     # SQLite — codes, subscriptions, stats
+├── messages.py     # Todos los textos (personaliza aquí)
+├── keyboards.py    # Todos los botones inline
+├── Dockerfile
+├── railway.toml
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## ⏰ Automático (sin intervención)
+
+| Evento | Acción |
+|---|---|
+| Código vence | Expulsa del canal + notifica al usuario + avisa al admin |
+| Faltan 3 días | Aviso automático al usuario con botón de renovar |
+| Usuario activa | Admin recibe notificación inmediata |
+| Usuario renueva | Admin recibe notificación inmediata |
