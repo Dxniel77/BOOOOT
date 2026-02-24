@@ -679,7 +679,13 @@ def main() -> None:
     app = build_application()
     app.post_init = post_init
     logger.info("Iniciando bot...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        # ✅ FIX: descarta updates acumulados al arrancar.
+        # Evita el error Conflict cuando había otra instancia corriendo
+        # (ej: pruebas locales + Railway al mismo tiempo).
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
