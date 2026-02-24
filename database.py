@@ -4,7 +4,7 @@ OPTIMIZACIONES:
   ✅ aiosqlite — no bloquea el Event Loop
   ✅ WAL mode — concurrencia sin bloqueos
   ✅ Índices en columnas de búsqueda frecuente
-  ✅ Manejo de errores robusto en cada función
+  ✅ invite_link por usuario para revocar al vencer
 """
 
 import logging
@@ -20,12 +20,7 @@ DB_DIR  = os.getenv("DB_DIR", ".")
 DB_PATH = os.path.join(DB_DIR, "bot.db")
 
 
-# ══════════════════════════════════════════════
-#  INICIALIZACIÓN
-# ══════════════════════════════════════════════
-
 async def init_db() -> None:
-    """Crea tablas + índices y habilita WAL. Llamar una vez al arrancar el bot."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
@@ -44,14 +39,15 @@ async def init_db() -> None:
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS subscriptions (
-                user_id     INTEGER PRIMARY KEY,
-                username    TEXT,
-                full_name   TEXT,
-                expires_at  TEXT NOT NULL,
-                code_used   TEXT,
-                warned_3d   INTEGER NOT NULL DEFAULT 0,
-                created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL
+                user_id      INTEGER PRIMARY KEY,
+                username     TEXT,
+                full_name    TEXT,
+                expires_at   TEXT NOT NULL,
+                code_used    TEXT,
+                invite_link  TEXT,
+                warned_3d    INTEGER NOT NULL DEFAULT 0,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
             )
         """)
 
@@ -78,7 +74,6 @@ async def init_db() -> None:
 # ══════════════════════════════════════════════
 
 async def create_code(code: str, days: int, max_uses: int = 1) -> bool:
-    """Crea un código nuevo. Retorna False si ya existe."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("PRAGMA journal_mode=WAL")
@@ -96,7 +91,6 @@ async def create_code(code: str, days: int, max_uses: int = 1) -> bool:
 
 
 async def get_code(code: str) -> Optional[dict]:
-    """Obtiene un código activo o None si no existe."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("PRAGMA journal_mode=WAL")
@@ -111,12 +105,7 @@ async def get_code(code: str) -> Optional[dict]:
         return None
 
 
-async def use_code(code: str, user_id: int, username: str, full_name: str) -> Optional[int]:
-    """
-    Valida y usa un código.  
-    - Si el usuario ya tiene suscripción activa, suma días encima.  
-    - Retorna los días añadidos, o None si el código no es válido/agotado.
-    """
+async def use_code(code: str, user_id: int, username: str, full_name: str, invite_link: str = None) -> Optional[int]:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("PRAGMA journal_mode=WAL")
@@ -150,17 +139,18 @@ async def use_code(code: str, user_id: int, username: str, full_name: str) -> Op
 
             await db.execute("""
                 INSERT INTO subscriptions
-                    (user_id, username, full_name, expires_at, code_used, warned_3d, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                    (user_id, username, full_name, expires_at, code_used, invite_link, warned_3d, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
                 ON CONFLICT(user_id) DO UPDATE SET
-                    username   = excluded.username,
-                    full_name  = excluded.full_name,
-                    expires_at = excluded.expires_at,
-                    code_used  = excluded.code_used,
-                    warned_3d  = 0,
-                    updated_at = excluded.updated_at
+                    username    = excluded.username,
+                    full_name   = excluded.full_name,
+                    expires_at  = excluded.expires_at,
+                    code_used   = excluded.code_used,
+                    invite_link = excluded.invite_link,
+                    warned_3d   = 0,
+                    updated_at  = excluded.updated_at
             """, (user_id, username, full_name, new_expiry.isoformat(),
-                  code.upper(), now.isoformat(), now.isoformat()))
+                  code.upper(), invite_link, now.isoformat(), now.isoformat()))
 
             new_count = code_data["used_count"] + 1
             await db.execute(
@@ -226,6 +216,56 @@ async def get_subscription(user_id: int) -> Optional[dict]:
         return None
 
 
+async def get_all_active_subscriptions() -> list:
+    try:
+        now = datetime.now().isoformat()
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM subscriptions WHERE expires_at > ? ORDER BY expires_at ASC", (now,)
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error("get_all_active_subscriptions error: %s", e)
+        return []
+
+
+async def get_all_active_user_ids() -> set:
+    try:
+        now = datetime.now().isoformat()
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            async with db.execute(
+                "SELECT user_id FROM subscriptions WHERE expires_at > ?", (now,)
+            ) as cur:
+                rows = await cur.fetchall()
+        return {row[0] for row in rows}
+    except Exception as e:
+        logger.error("get_all_active_user_ids error: %s", e)
+        return set()
+
+
+async def search_user(query: str) -> list:
+    """Busca por username, nombre o user_id."""
+    try:
+        like = f"%{query}%"
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            db.row_factory = aiosqlite.Row
+            async with db.execute("""
+                SELECT * FROM subscriptions
+                WHERE username LIKE ? OR full_name LIKE ? OR CAST(user_id AS TEXT) LIKE ?
+                ORDER BY expires_at DESC LIMIT 10
+            """, (like, like, like)) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error("search_user error: %s", e)
+        return []
+
+
 async def get_expired_subscriptions() -> list:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -284,6 +324,34 @@ async def delete_subscription(user_id: int) -> None:
         logger.error("delete_subscription error: %s", e)
 
 
+async def log_intruder_kicked(user_id: int, username: str) -> None:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            await db.execute(
+                "INSERT INTO stats (event, user_id, detail, created_at) VALUES (?, ?, ?, ?)",
+                ("intruder_kicked", user_id, username, datetime.now().isoformat())
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error("log_intruder_kicked error: %s", e)
+
+
+async def get_intruder_log() -> list:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("PRAGMA journal_mode=WAL")
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM stats WHERE event = 'intruder_kicked' ORDER BY created_at DESC LIMIT 20"
+            ) as cur:
+                rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.error("get_intruder_log error: %s", e)
+        return []
+
+
 async def get_stats() -> dict:
     try:
         now     = datetime.now().isoformat()
@@ -305,12 +373,17 @@ async def get_stats() -> dict:
                 active_codes = (await cur.fetchone())[0]
             async with db.execute("SELECT COUNT(*) FROM codes") as cur:
                 total_codes = (await cur.fetchone())[0]
+            async with db.execute(
+                "SELECT COUNT(*) FROM stats WHERE event = 'intruder_kicked'"
+            ) as cur:
+                total_kicked = (await cur.fetchone())[0]
         return {
-            "total_subs":   total_subs,
-            "active_subs":  active_subs,
+            "total_subs":    total_subs,
+            "active_subs":   active_subs,
             "expiring_soon": expiring_soon,
-            "active_codes": active_codes,
-            "total_codes":  total_codes,
+            "active_codes":  active_codes,
+            "total_codes":   total_codes,
+            "total_kicked":  total_kicked,
         }
     except Exception as e:
         logger.error("get_stats error: %s", e)
