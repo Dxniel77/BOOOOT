@@ -679,13 +679,19 @@ def main() -> None:
     app = build_application()
     app.post_init = post_init
     logger.info("Iniciando bot...")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        # ✅ FIX: descarta updates acumulados al arrancar.
-        # Evita el error Conflict cuando había otra instancia corriendo
-        # (ej: pruebas locales + Railway al mismo tiempo).
-        drop_pending_updates=True,
-    )
+    try:
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            # Descarta updates acumulados — evita Conflict al reiniciar.
+            drop_pending_updates=True,
+            # Cierre limpio: Railway espera a que el proceso muera
+            # antes de lanzar la nueva instancia.
+            close_loop=True,
+        )
+    except Exception as e:
+        logger.error("Error fatal: %s", e)
+    finally:
+        logger.info("Bot detenido correctamente.")
 
 
 if __name__ == "__main__":
