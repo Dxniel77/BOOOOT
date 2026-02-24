@@ -1,196 +1,143 @@
 """
-messages.py — Todos los textos del bot.
-Edita aquí sin tocar lógica.
+messages.py — Todos los textos del bot (personaliza aquí)
 """
-from datetime import datetime, timezone
+from datetime import datetime
 
 
 def fmt_date(iso: str) -> str:
-    dt = datetime.fromisoformat(iso)
-    if not dt.tzinfo:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.strftime("%d/%m/%Y %H:%M UTC")
+    try:
+        return datetime.fromisoformat(iso).strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return iso
 
 
-def days_left(iso: str) -> int:
-    dt = datetime.fromisoformat(iso)
-    if not dt.tzinfo:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return max(0, (dt - datetime.now(timezone.utc)).days)
+def progress_bar(expires_at: str, total_days: int = 30) -> str:
+    try:
+        now    = datetime.now()
+        expiry = datetime.fromisoformat(expires_at)
+        remaining = (expiry - now).total_seconds()
+        total     = total_days * 86400
+        pct       = max(0.0, min(1.0, remaining / total))
+        filled    = int(pct * 10)
+        bar       = "█" * filled + "░" * (10 - filled)
+        return f"[{bar}] {int(pct*100)}%"
+    except Exception:
+        return "[██████████] ?"
 
 
-def progress_bar(days: int, max_days: int = 30, width: int = 15) -> str:
-    filled = min(width, int((days / max(max_days, 1)) * width))
-    empty  = width - filled
-    color  = "🟩" if days > 7 else "🟨" if days > 3 else "🟥"
-    return color * filled + "⬜" * empty
+WELCOME = (
+    "👋 *¡Bienvenido al bot de suscripción!*\n\n"
+    "Usa los botones de abajo para gestionar tu acceso."
+)
 
+NO_SUBSCRIPTION = (
+    "❌ *No tienes una suscripción activa.*\n\n"
+    "Usa *🔑 Activar código* para acceder al canal."
+)
 
-# ── Usuario ───────────────────────────────────────────────────────────────────
+ENTER_CODE = "✏️ Escribe tu código de activación:"
 
-def welcome(name: str) -> str:
+ENTER_CODE_RENEW = "🔄 Escribe el código para renovar tu suscripción:"
+
+CODE_NOT_FOUND = "❌ Código inválido o agotado. Verifica e inténtalo de nuevo."
+
+CODE_SUCCESS = (
+    "✅ *¡Código activado correctamente!*\n\n"
+    "Se te han añadido *{days} días* de acceso.\n"
+    "Tu suscripción vence el: `{expires_at}`"
+)
+
+CODE_RENEWED = (
+    "🔄 *¡Suscripción renovada!*\n\n"
+    "Se añadieron *{days} días* a tu acceso.\n"
+    "Nueva fecha de vencimiento: `{expires_at}`"
+)
+
+def subscription_status(sub: dict) -> str:
+    now    = datetime.now()
+    expiry = datetime.fromisoformat(sub["expires_at"])
+    days_left = (expiry - now).days
+    status = "✅ Activa" if expiry > now else "❌ Vencida"
+    bar    = progress_bar(sub["expires_at"])
     return (
-        f"👋 *¡Hola, {name}!*\n\n"
-        "Bienvenido al acceso exclusivo.\n"
-        "Usa los botones de abajo para gestionar tu suscripción 👇"
+        f"📊 *Mi suscripción*\n\n"
+        f"Estado: {status}\n"
+        f"Vence: `{fmt_date(sub['expires_at'])}`\n"
+        f"Días restantes: *{max(0, days_left)}*\n\n"
+        f"{bar}"
     )
 
+CONTACT_ADMIN = "📞 Contacta al administrador: @adminusername"
 
-def menu_user_no_sub() -> str:
+ADMIN_WELCOME = "🛡️ *Panel de Administración*\n\nSelecciona una acción:"
+
+def admin_gen_code_prompt():
     return (
-        "📋 *Menú principal*\n\n"
-        "No tienes una suscripción activa.\n"
-        "Pulsa *\"🔑 Activar código\"* para comenzar."
+        "🔑 *Generar código nuevo*\n\n"
+        "Escribe en formato:\n"
+        "`CODIGO DIAS USOS`\n\n"
+        "Ejemplo: `VIP30 30 5`\n"
+        "_(crea el código VIP30 por 30 días con 5 usos)_"
     )
-
-
-def menu_user_active(expires_at: str) -> str:
-    dl  = days_left(expires_at)
-    bar = progress_bar(dl)
-    em  = "🟢" if dl > 7 else "🟡" if dl > 3 else "🔴"
-    return (
-        f"📋 *Tu suscripción*\n\n"
-        f"{em} Estado: *Activa*\n"
-        f"📅 Vence: `{fmt_date(expires_at)}`\n"
-        f"⏳ Quedan: *{dl} día{'s' if dl != 1 else ''}*\n\n"
-        f"`{bar}` {dl}d"
-    )
-
-
-def ask_for_code(action: str) -> str:
-    verb = "activar" if action == "activate" else "renovar"
-    return (
-        f"✏️ Escribe tu código de {verb}:\n\n"
-        "_Solo escribe el código, sin comandos._\n\n"
-        "Para cancelar pulsa ❌ Cancelar."
-    )
-
-
-def activated_ok(name: str, expires_at: str) -> str:
-    dl = days_left(expires_at)
-    return (
-        f"✅ *¡Acceso activado, {name}!*\n\n"
-        f"📅 Válido hasta: `{fmt_date(expires_at)}`\n"
-        f"⏳ *{dl} día{'s' if dl != 1 else ''}* de acceso\n\n"
-        "🎉 ¡Ya puedes entrar al canal!"
-    )
-
-
-def renewed_ok(expires_at: str) -> str:
-    dl = days_left(expires_at)
-    return (
-        f"🔄 *¡Renovación exitosa!*\n\n"
-        f"📅 Nueva fecha: `{fmt_date(expires_at)}`\n"
-        f"⏳ *{dl} día{'s' if dl != 1 else ''}* restantes"
-    )
-
-
-def err_code_invalid()    -> str: return "❌ *Código inválido o inexistente.*\nVerifica e inténtalo de nuevo."
-def err_code_exhausted()  -> str: return "❌ *Este código ya no tiene usos disponibles.*\nContacta al administrador."
-def err_already_active(expires_at: str) -> str:
-    return (
-        f"⚠️ *Ya tienes una suscripción activa.*\n\n"
-        f"Vence el `{fmt_date(expires_at)}`\n\n"
-        "Para extenderla usa el botón *🔄 Renovar*."
-    )
-def err_no_sub_to_renew() -> str: return "❌ *No tienes suscripción activa para renovar.*\nUsa primero *🔑 Activar código*."
-def err_cancelled()       -> str: return "↩️ Operación cancelada."
-def status_no_sub()       -> str: return "📭 *No tienes suscripción activa.*"
-
-
-def expiry_warning(name: str, expires_at: str) -> str:
-    dl = days_left(expires_at)
-    return (
-        f"⚠️ *¡Atención, {name}!*\n\n"
-        f"Tu suscripción vence en *{dl} día{'s' if dl != 1 else ''}*\n"
-        f"📅 `{fmt_date(expires_at)}`\n\n"
-        "Pulsa *🔄 Renovar* en el menú para extender tu acceso."
-    )
-
-
-def expired_notice(name: str) -> str:
-    return (
-        f"🔴 *{name}, tu suscripción venció.*\n\n"
-        "Has sido removido del canal.\n"
-        "Activa un nuevo código cuando quieras volver 👇"
-    )
-
-
-# ── Admin ─────────────────────────────────────────────────────────────────────
-
-def admin_menu() -> str:
-    return "🛡️ *Panel de Administración*\n\nSelecciona una acción:"
-
 
 def admin_code_created(code: str, days: int, max_uses: int) -> str:
     return (
-        f"✅ *Código creado*\n\n"
-        f"🔑 `{code}`\n"
-        f"📅 {days} días · 👥 {max_uses} uso{'s' if max_uses != 1 else ''}"
+        f"✅ *Código creado:*\n\n"
+        f"Código: `{code}`\n"
+        f"Días: *{days}*\n"
+        f"Usos máximos: *{max_uses}*"
     )
 
+ADMIN_CODE_EXISTS = "⚠️ Ese código ya existe. Usa otro nombre."
+ADMIN_CODE_INVALID = "❌ Formato inválido. Usa: `CODIGO DIAS USOS`\nEjemplo: `VIP30 30 1`"
 
-def admin_code_exists()   -> str: return "⚠️ Ya existe ese código. Elige otro nombre."
-def admin_not_authorized() -> str: return "🚫 No tienes permisos de administrador."
-
-
-def admin_ask_code_data() -> str:
-    return (
-        "✏️ *Nuevo código*\n\n"
-        "Escribe en una línea:\n`CODIGO DIAS USOS`\n\n"
-        "_Ejemplo:_ `VIP2024 30 5`\n\n"
-        "Para cancelar escribe `cancelar`."
-    )
-
-
-def admin_ask_deactivate() -> str:
-    return (
-        "✏️ *Desactivar código*\n\n"
-        "Escribe el nombre del código a desactivar.\n\n"
-        "Para cancelar escribe `cancelar`."
-    )
-
-
-def admin_stats(s: dict) -> str:
-    return (
-        "📊 *Estadísticas*\n\n"
-        f"👥 Usuarios totales:     *{s['total_users']}*\n"
-        f"✅ Suscripciones activas: *{s['active_users']}*\n"
-        f"⚠️  Vencen en ≤3 días:   *{s['expiring_soon']}*\n"
-        f"📈 Activaciones hoy:     *{s['uses_today']}*\n\n"
-        f"🔑 Códigos activos: *{s['active_codes']}* / {s['total_codes']} totales"
-    )
-
-
-def admin_codes_list(codes: list) -> str:
+def admin_list_codes(codes: list) -> str:
     if not codes:
-        return "📭 No hay códigos activos."
-    lines = ["🗂️ *Códigos activos*\n"]
-    for c in codes[:20]:
-        left = c["max_uses"] - c["used_times"]
-        icon = "🟢" if left > 0 else "🔴"
-        lines.append(f"{icon} `{c['code']}` — {c['days']}d — {c['used_times']}/{c['max_uses']} usos")
-    if len(codes) > 20:
-        lines.append(f"\n_...y {len(codes)-20} más_")
+        return "📋 No hay códigos activos."
+    lines = ["📋 *Códigos activos:*\n"]
+    for c in codes:
+        lines.append(
+            f"• `{c['code']}` — {c['days']}d | "
+            f"{c['used_count']}/{c['max_uses']} usos"
+        )
     return "\n".join(lines)
 
+def admin_stats_msg(stats: dict) -> str:
+    return (
+        f"📊 *Estadísticas*\n\n"
+        f"👥 Suscriptores totales: *{stats.get('total_subs', 0)}*\n"
+        f"✅ Activos: *{stats.get('active_subs', 0)}*\n"
+        f"⚠️ Vencen en 3 días: *{stats.get('expiring_soon', 0)}*\n\n"
+        f"🔑 Códigos activos: *{stats.get('active_codes', 0)}* / "
+        f"{stats.get('total_codes', 0)} total"
+    )
+
+ADMIN_ENTER_DEACTIVATE = "🔴 Escribe el código que deseas desactivar:"
+
+def admin_confirm_deactivate(code: str) -> str:
+    return f"⚠️ ¿Confirmas desactivar el código `{code}`?"
 
 def admin_deactivated(code: str) -> str:
-    return f"✅ Código `{code}` desactivado."
-def admin_code_not_found()  -> str: return "❌ Código no encontrado."
-def admin_user_kicked(uid, name) -> str:
-    return f"🚫 *{name}* (`{uid}`) removido del canal."
-def admin_kick_failed(uid)  -> str:
-    return f"⚠️ No pude expulsar a `{uid}`. ¿El bot es admin del canal?"
-def admin_new_activation(name, uid, code, expires_at) -> str:
+    return f"✅ Código `{code}` desactivado correctamente."
+
+def admin_new_activation(user_id: int, username: str, full_name: str, days: int) -> str:
+    uname = f"@{username}" if username else full_name
     return (
-        f"🆕 *Nueva activación*\n"
-        f"👤 {name} (`{uid}`)\n"
-        f"🔑 `{code}` · hasta `{fmt_date(expires_at)}`"
+        f"🔔 *Nueva activación*\n\n"
+        f"Usuario: {uname} (`{user_id}`)\n"
+        f"Días añadidos: *{days}*"
     )
-def admin_renewal(name, uid, code, expires_at) -> str:
+
+def warn_expiring(days_left: int) -> str:
     return (
-        f"🔄 *Renovación*\n"
-        f"👤 {name} (`{uid}`)\n"
-        f"🔑 `{code}` · nueva fecha `{fmt_date(expires_at)}`"
+        f"⚠️ *Tu suscripción vence en {days_left} días.*\n\n"
+        "Renueva con el botón 🔄 Renovar para no perder el acceso."
     )
+
+SUBSCRIPTION_EXPIRED = (
+    "😔 Tu suscripción ha vencido y fuiste removido del canal.\n\n"
+    "Usa *🔑 Activar código* para volver a acceder."
+)
+
+CANCEL = "❌ Acción cancelada."
+OPERATION_TIMEOUT = "⏰ Tiempo de espera agotado. Vuelve al menú e inténtalo de nuevo."
