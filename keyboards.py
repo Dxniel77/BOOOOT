@@ -1,159 +1,198 @@
 """
-╔══════════════════════════════════════════════╗
-║          DX VIP BOT — keyboards.py           ║
-║   Todos los teclados InlineKeyboard          ║
-╚══════════════════════════════════════════════╝
+keyboards.py — DX VIP Bot · Teclados inline
 """
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-# ══════════════════════════════════════════════
-# MENÚ PRINCIPAL (USUARIO)
-# ══════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════════════════
+# USUARIO — Menú principal
+# ══════════════════════════════════════════════════════════════
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔑 Activar código",      callback_data="activate_code"),
-            InlineKeyboardButton("🔄 Renovar acceso",      callback_data="renew_code"),
+            InlineKeyboardButton("🔑 Activar código",   callback_data="activate"),
+            InlineKeyboardButton("🔄 Renovar acceso",   callback_data="renew"),
         ],
         [
-            InlineKeyboardButton("💎 Mi membresía",        callback_data="my_subscription"),
-            InlineKeyboardButton("👥 Mis referidos",       callback_data="my_referrals"),
+            InlineKeyboardButton("💎 Mi membresía",     callback_data="membership"),
+            InlineKeyboardButton("🎁 Prueba gratis",    callback_data="free_trial"),
         ],
         [
-            InlineKeyboardButton("🎁 Prueba gratis 2d",    callback_data="free_trial"),
-            InlineKeyboardButton("📜 Mi historial",        callback_data="my_history"),
+            InlineKeyboardButton("🎰 Ruleta semanal",   callback_data="ruleta"),
+            InlineKeyboardButton("🎟️ Soporte",          callback_data="support"),
         ],
         [
-            InlineKeyboardButton("🔗 Obtener link referido", callback_data="get_referral_link"),
-        ],
-        [
-            InlineKeyboardButton("ℹ️ Ayuda",               callback_data="help"),
+            InlineKeyboardButton("📜 Mi historial",     callback_data="history"),
         ],
     ])
 
 
-def back_to_main() -> InlineKeyboardMarkup:
+# ══════════════════════════════════════════════════════════════
+# USUARIO — Membresía / Mini App
+# ══════════════════════════════════════════════════════════════
+def membership_menu(miniapp_url: str = None) -> InlineKeyboardMarkup:
+    rows = []
+    if miniapp_url:
+        rows.append([
+            InlineKeyboardButton("💎 Ver tarjeta VIP", web_app={"url": miniapp_url})
+        ])
+    rows.append([InlineKeyboardButton("🏠 Menú principal", callback_data="main_menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ══════════════════════════════════════════════════════════════
+# USUARIO — Soporte / Tickets
+# ══════════════════════════════════════════════════════════════
+def support_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🏠 Menú principal", callback_data="main_menu")]
+        [InlineKeyboardButton("✏️ Abrir nuevo ticket",   callback_data="ticket_new")],
+        [InlineKeyboardButton("📋 Mis tickets",          callback_data="ticket_list")],
+        [InlineKeyboardButton("🏠 Menú principal",       callback_data="main_menu")],
     ])
 
+def ticket_user_actions(ticket_id: int, is_open: bool) -> InlineKeyboardMarkup:
+    rows = []
+    if is_open:
+        rows.append([InlineKeyboardButton("💬 Responder", callback_data=f"ticket_reply_{ticket_id}")])
+        rows.append([InlineKeyboardButton("✅ Cerrar ticket", callback_data=f"ticket_close_{ticket_id}")])
+    else:
+        rows.append([InlineKeyboardButton("🔄 Reabrir ticket", callback_data=f"ticket_reopen_{ticket_id}")])
+    rows.append([InlineKeyboardButton("« Volver", callback_data="ticket_list")])
+    return InlineKeyboardMarkup(rows)
 
-def cancel_button() -> InlineKeyboardMarkup:
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancelar", callback_data="main_menu")
+    ]])
+
+
+# ══════════════════════════════════════════════════════════════
+# USUARIO — Ruleta
+# ══════════════════════════════════════════════════════════════
+def ruleta_play() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Cancelar", callback_data="cancel")]
+        [InlineKeyboardButton("🎰 ¡Girar ruleta!", callback_data="ruleta_spin")],
+        [InlineKeyboardButton("🏠 Menú principal", callback_data="main_menu")],
     ])
 
-
-def confirm_free_trial() -> InlineKeyboardMarkup:
+def ruleta_result() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Sí, activar 2 días gratis", callback_data="confirm_free_trial"),
-            InlineKeyboardButton("❌ No", callback_data="main_menu"),
-        ]
+        [InlineKeyboardButton("💎 Ver mi membresía", callback_data="membership")],
+        [InlineKeyboardButton("🏠 Menú principal",   callback_data="main_menu")],
     ])
 
 
-# ══════════════════════════════════════════════
-# PANEL ADMIN
-# ══════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════════════════
+# ADMIN — Panel principal
+# ══════════════════════════════════════════════════════════════
 def admin_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("➕ Generar código",      callback_data="admin_gen_code"),
-            InlineKeyboardButton("📋 Listar códigos",      callback_data="admin_list_codes"),
+            InlineKeyboardButton("🔑 Generar código",    callback_data="adm_gen_code"),
+            InlineKeyboardButton("📋 Listar códigos",    callback_data="adm_list_codes"),
         ],
         [
-            InlineKeyboardButton("📊 Estadísticas",        callback_data="admin_stats"),
-            InlineKeyboardButton("👥 Miembros activos",    callback_data="admin_members"),
+            InlineKeyboardButton("👥 Miembros activos",  callback_data="adm_members"),
+            InlineKeyboardButton("📊 Estadísticas",      callback_data="adm_stats"),
         ],
         [
-            InlineKeyboardButton("🔍 Buscar usuario",      callback_data="admin_search"),
-            InlineKeyboardButton("🚫 Expulsar usuario",    callback_data="admin_kick"),
+            InlineKeyboardButton("🎟️ Tickets soporte",  callback_data="adm_tickets"),
+            InlineKeyboardButton("🏆 Ranking",           callback_data="adm_ranking"),
         ],
         [
-            InlineKeyboardButton("📢 Broadcast",           callback_data="admin_broadcast"),
-            InlineKeyboardButton("🕵️ Intrusos",            callback_data="admin_intruders"),
+            InlineKeyboardButton("🚫 Blacklist",         callback_data="adm_blacklist"),
+            InlineKeyboardButton("📢 Broadcast",         callback_data="adm_broadcast"),
         ],
         [
-            InlineKeyboardButton("🔇 Blacklist",           callback_data="admin_blacklist"),
-            InlineKeyboardButton("📋 Auditoría",           callback_data="admin_audit"),
-        ],
-        [
-            InlineKeyboardButton("⚙️ Mantenimiento",       callback_data="admin_maintenance"),
-            InlineKeyboardButton("🔄 Actualizar",          callback_data="admin_refresh"),
+            InlineKeyboardButton("🔧 Mantenimiento",     callback_data="adm_maintenance"),
         ],
     ])
-
-
-def admin_back() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Panel admin", callback_data="admin_back")]
-    ])
-
 
 def admin_gen_code_shortcuts() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("7d / 1 uso",    callback_data="admin_quickcode_7_1"),
-            InlineKeyboardButton("15d / 1 uso",   callback_data="admin_quickcode_15_1"),
-            InlineKeyboardButton("30d / 1 uso",   callback_data="admin_quickcode_30_1"),
+            InlineKeyboardButton("7d · 1 uso",   callback_data="adm_quick_7"),
+            InlineKeyboardButton("15d · 1 uso",  callback_data="adm_quick_15"),
+            InlineKeyboardButton("30d · 1 uso",  callback_data="adm_quick_30"),
         ],
         [
-            InlineKeyboardButton("30d / 5 usos",  callback_data="admin_quickcode_30_5"),
-            InlineKeyboardButton("60d / 1 uso",   callback_data="admin_quickcode_60_1"),
-            InlineKeyboardButton("90d / 1 uso",   callback_data="admin_quickcode_90_1"),
+            InlineKeyboardButton("60d · 1 uso",  callback_data="adm_quick_60"),
+            InlineKeyboardButton("90d · 1 uso",  callback_data="adm_quick_90"),
+            InlineKeyboardButton("✏️ Personalizado", callback_data="adm_custom_code"),
         ],
-        [InlineKeyboardButton("❌ Cancelar", callback_data="cancel")],
+        [InlineKeyboardButton("« Panel",         callback_data="adm_panel")],
     ])
 
+def admin_back() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("« Panel admin", callback_data="adm_panel")
+    ]])
 
-def admin_confirm_kick(user_id: int) -> InlineKeyboardMarkup:
+
+# ══════════════════════════════════════════════════════════════
+# ADMIN — Tickets
+# ══════════════════════════════════════════════════════════════
+def admin_tickets_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📬 Tickets abiertos",  callback_data="adm_tickets_open")],
+        [InlineKeyboardButton("📁 Todos los tickets", callback_data="adm_tickets_all")],
+        [InlineKeyboardButton("« Panel",              callback_data="adm_panel")],
+    ])
+
+def admin_ticket_actions(ticket_id: int, is_open: bool) -> InlineKeyboardMarkup:
+    rows = []
+    rows.append([InlineKeyboardButton("💬 Responder", callback_data=f"adm_ticket_reply_{ticket_id}")])
+    if is_open:
+        rows.append([InlineKeyboardButton("✅ Cerrar ticket", callback_data=f"adm_ticket_close_{ticket_id}")])
+    else:
+        rows.append([InlineKeyboardButton("🔄 Reabrir ticket", callback_data=f"adm_ticket_reopen_{ticket_id}")])
+    rows.append([InlineKeyboardButton("« Tickets", callback_data="adm_tickets")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ══════════════════════════════════════════════════════════════
+# ADMIN — Miembros / Blacklist
+# ══════════════════════════════════════════════════════════════
+def admin_member_actions(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Confirmar", callback_data=f"admin_kick_confirm_{user_id}"),
-            InlineKeyboardButton("❌ Cancelar",  callback_data="admin_back"),
-        ]
-    ])
-
-
-def admin_confirm_ban(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+            InlineKeyboardButton("➕ Añadir días",  callback_data=f"adm_adddays_{user_id}"),
+            InlineKeyboardButton("🚪 Expulsar",     callback_data=f"adm_kick_{user_id}"),
+        ],
         [
-            InlineKeyboardButton("🔇 Sí, banear",  callback_data=f"admin_ban_confirm_{user_id}"),
-            InlineKeyboardButton("❌ Cancelar",     callback_data="admin_back"),
-        ]
+            InlineKeyboardButton("🚫 Banear",       callback_data=f"adm_ban_{user_id}"),
+            InlineKeyboardButton("🔍 Buscar",       callback_data=f"adm_search_{user_id}"),
+        ],
+        [InlineKeyboardButton("« Miembros",         callback_data="adm_members")],
     ])
 
-
-def admin_broadcast_confirm(msg_preview: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📢 Enviar a todos", callback_data="admin_broadcast_confirm"),
-            InlineKeyboardButton("❌ Cancelar",        callback_data="admin_back"),
-        ]
-    ])
-
-
-def admin_maintenance_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧹 Limpiar vencidos ahora",     callback_data="admin_force_cleanup")],
-        [InlineKeyboardButton("🔎 Escanear intrusos ahora",    callback_data="admin_force_scan")],
-        [InlineKeyboardButton("💾 Backup DB al admin",         callback_data="admin_backup_db")],
-        [InlineKeyboardButton("📜 Historial broadcasts",       callback_data="admin_broadcast_history")],
-        [InlineKeyboardButton("⬅️ Panel admin",                callback_data="admin_back")],
-    ])
-
+def confirm_action(yes_data: str, no_data: str = "adm_panel") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Confirmar", callback_data=yes_data),
+        InlineKeyboardButton("❌ Cancelar",  callback_data=no_data),
+    ]])
 
 def admin_blacklist_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("➕ Banear usuario",   callback_data="admin_ban"),
-            InlineKeyboardButton("➖ Desbanear usuario", callback_data="admin_unban"),
+            InlineKeyboardButton("🚫 Banear usuario",    callback_data="adm_ban_input"),
+            InlineKeyboardButton("✅ Desbanear usuario", callback_data="adm_unban_input"),
         ],
-        [InlineKeyboardButton("📋 Ver blacklist",       callback_data="admin_view_blacklist")],
-        [InlineKeyboardButton("⬅️ Panel admin",         callback_data="admin_back")],
+        [InlineKeyboardButton("📋 Ver blacklist",        callback_data="adm_blacklist_list")],
+        [InlineKeyboardButton("« Panel",                 callback_data="adm_panel")],
+    ])
+
+
+# ══════════════════════════════════════════════════════════════
+# ADMIN — Mantenimiento
+# ══════════════════════════════════════════════════════════════
+def admin_maintenance_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧹 Limpiar vencidos",      callback_data="adm_clean_expired")],
+        [InlineKeyboardButton("👻 Scan intrusos",         callback_data="adm_scan_intruders")],
+        [InlineKeyboardButton("📜 Historial broadcasts",  callback_data="adm_broadcast_history")],
+        [InlineKeyboardButton("📋 Log auditoría",         callback_data="adm_audit_log")],
+        [InlineKeyboardButton("💾 Backup DB",             callback_data="adm_backup")],
+        [InlineKeyboardButton("« Panel",                  callback_data="adm_panel")],
     ])
