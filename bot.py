@@ -329,17 +329,7 @@ async def my_history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     await query.answer()
     user   = update.effective_user
-    events = []
-    async def _get():
-        import aiosqlite
-        from database import get_connection
-        async with await get_connection() as dbc:
-            async with dbc.execute(
-                "SELECT * FROM stats WHERE user_id=? ORDER BY created_at DESC LIMIT 20",
-                (user.id,)
-            ) as cur:
-                return await cur.fetchall()
-    events = await _get()
+    events = await db.get_user_events(user.id, limit=20)
     await query.edit_message_text(
         msg.user_history(events),
         reply_markup=kb.back_to_main(),
@@ -1259,18 +1249,8 @@ async def job_daily_summary(context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("JOB: daily_summary iniciado")
     counts      = await db.count_subscriptions()
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0).isoformat()
-    import aiosqlite
-    from database import get_connection
-    async with await get_connection() as dbc:
-        async with dbc.execute(
-            "SELECT COUNT(*) FROM subscriptions WHERE created_at>=?", (today_start,)
-        ) as cur:
-            new_today = (await cur.fetchone())[0]
-        async with dbc.execute(
-            "SELECT COUNT(*) FROM stats WHERE event='expired_kicked' AND created_at>=?",
-            (today_start,)
-        ) as cur:
-            expired_today = (await cur.fetchone())[0]
+    new_today     = await db.get_daily_new_users(today_start)
+    expired_today = await db.get_daily_expired(today_start)
     await safe_send(
         context.bot, ADMIN_ID,
         msg.daily_summary(counts, new_today, expired_today),
