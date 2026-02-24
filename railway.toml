@@ -2,8 +2,5 @@
 builder = "dockerfile"
 
 [deploy]
-restartPolicyType = "always"
-# ✅ FIX Conflict: Railway espera a que la instancia vieja muera
-# antes de lanzar la nueva. Evita dos instancias simultáneas.
-numReplicas = 1
-restartPolicyMaxRetries = 3
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 5
