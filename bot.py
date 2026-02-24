@@ -1,3 +1,5 @@
+import subprocess, sys
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-cache-dir", "python-telegram-bot[job-queue]==20.7", "APScheduler==3.10.4"])
 import os
 import json
 import random
