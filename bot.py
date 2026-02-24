@@ -1270,17 +1270,28 @@ async def job_process_referral_bonuses(context: ContextTypes.DEFAULT_TYPE) -> No
 async def post_init(application: Application) -> None:
     await db.init_db()
     jq = application.job_queue
+    if jq is None:
+        logger.warning(
+            "⚠️  JobQueue no disponible. Instala: pip install 'python-telegram-bot[job-queue]'. "
+            "Los jobs automáticos (limpieza, avisos, resumen) están DESACTIVADOS."
+        )
+        return
     # Cada hora: limpiar vencidos
-    jq.run_repeating(job_cleanup,       interval=3600,  first=60,   name="cleanup")
+    jq.run_repeating(job_cleanup,  interval=3600,  first=60,  name="cleanup")
     # Cada 30 min: escanear intrusos
-    jq.run_repeating(job_scan,          interval=1800,  first=120,  name="scan")
-    # Cada 12h: avisar 3 días
-    jq.run_repeating(job_warn_3d,       interval=43200, first=300,  name="warn_3d")
-    # Cada 12h: avisar 1 día
-    jq.run_repeating(job_warn_1d,       interval=43200, first=360,  name="warn_1d")
+    jq.run_repeating(job_scan,     interval=1800,  first=120, name="scan")
+    # Cada 12h: avisar 3 días antes
+    jq.run_repeating(job_warn_3d,  interval=43200, first=300, name="warn_3d")
+    # Cada 12h: avisar 1 día antes
+    jq.run_repeating(job_warn_1d,  interval=43200, first=360, name="warn_1d")
     # Cada día a las 08:00 UTC: resumen al admin
-    jq.run_daily(job_daily_summary, time=datetime.strptime("08:00", "%H:%M").time().replace(tzinfo=timezone.utc), name="daily_summary")
-    logger.info("✅ Jobs registrados")
+    from datetime import time as dt_time
+    jq.run_daily(
+        job_daily_summary,
+        time=dt_time(hour=8, minute=0, tzinfo=timezone.utc),
+        name="daily_summary",
+    )
+    logger.info("✅ Jobs registrados correctamente")
 
 
 # ══════════════════════════════════════════════
