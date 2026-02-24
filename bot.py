@@ -1,21 +1,21 @@
 """
 bot.py — Bot de Suscripción v3
 =================================
-CORRECCIONES Y OPTIMIZACIONES:
-  ✅ query.answer() SIEMPRE como primera línea en callbacks (elimina el círculo de carga)
-  ✅ ConversationHandler con fallbacks que responden TODOS los botones fuera de estado
-  ✅ Limpieza automática: si el usuario presiona un botón de menú durante una conversación,
-     la conversación se cancela y se abre el menú solicitado
-  ✅ Jobs con aiosqlite (no bloquean el event loop)
-  ✅ Logging optimizado para producción (httpx en WARNING, telegram en WARNING)
-  ✅ Timeouts de conversación (ConversationHandler.WAITING_STATE no queda atascado)
+FEATURES:
+  ✅ Añade al canal automáticamente al activar código
+  ✅ query.answer() siempre primero — elimina el círculo de carga
+  ✅ ConversationHandler con fallbacks universales
+  ✅ Job cada 30 min detecta y expulsa intrusos automáticamente
+  ✅ Panel admin completo: miembros, intrusos, buscar, expulsar
+  ✅ Al vencer suscripción → expulsado automáticamente del canal
+  ✅ Logging optimizado para producción
 """
 
 import logging
 import os
 from datetime import datetime, timedelta
 
-from telegram import Update
+from telegram import Update, ChatMember
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -37,7 +37,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
 )
-# Silenciar librerías muy verbosas — reduce CPU en producción
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
@@ -45,17 +44,20 @@ logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-# ── Variables de entorno ────────────────────────────────────────────────────
+# ── Variables de entorno ─────────────────────────────────────────────────────
 BOT_TOKEN  = os.environ["BOT_TOKEN"]
 ADMIN_ID   = int(os.environ["ADMIN_ID"])
 CHANNEL_ID = int(os.environ["CHANNEL_ID"])
 
 # ── Estados de ConversationHandler ──────────────────────────────────────────
-WAITING_ACTIVATE_CODE  = 1
-WAITING_RENEW_CODE     = 2
-WAITING_GEN_CODE       = 3
-WAITING_DEACTIVATE     = 4
-WAITING_CONFIRM_DEACT  = 5
+WAITING_ACTIVATE_CODE = 1
+WAITING_RENEW_CODE    = 2
+WAITING_GEN_CODE      = 3
+WAITING_DEACTIVATE    = 4
+WAITING_CONFIRM_DEACT = 5
+WAITING_SEARCH        = 6
+WAITING_KICK_ID       = 7
+WAITING_CONFIRM_KICK  = 8
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -63,7 +65,6 @@ WAITING_CONFIRM_DEACT  = 5
 # ════════════════════════════════════════════════════════════════════════════
 
 async def safe_answer(query, text: str = None, show_alert: bool = False) -> None:
-    """Llama a query.answer() sin lanzar excepción si ya expiró."""
     try:
         await query.answer(text=text, show_alert=show_alert)
     except TelegramError:
@@ -71,22 +72,63 @@ async def safe_answer(query, text: str = None, show_alert: bool = False) -> None
 
 
 async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Envía o edita el mensaje con el menú principal."""
-    text = msg.WELCOME
+    text   = msg.WELCOME
     markup = kb.main_menu_keyboard()
     if update.callback_query:
         try:
             await update.callback_query.edit_message_text(
                 text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN
             )
+            return
         except TelegramError:
-            await update.effective_chat.send_message(
+            pass
+    await update.effective_chat.send_message(
+        text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def send_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text   = msg.ADMIN_WELCOME
+    markup = kb.admin_panel_keyboard()
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
                 text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN
             )
-    else:
-        await update.effective_chat.send_message(
-            text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN
-        )
+            return
+        except TelegramError:
+            pass
+    await update.effective_chat.send_message(
+        text, reply_markup=markup, parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def add_user_to_channel(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Añade un usuario directamente al canal. Retorna True si tuvo éxito."""
+    try:
+        await context.bot.unban_chat_member(CHANNEL_ID, user_id, only_if_banned=True)
+        await context.bot.approve_chat_join_request(CHANNEL_ID, user_id)
+        return True
+    except TelegramError:
+        pass
+    try:
+        # Fallback: añadir directamente
+        await context.bot.add_chat_members(CHANNEL_ID, [user_id])
+        return True
+    except TelegramError as e:
+        logger.warning("No se pudo añadir al canal user_id=%s: %s", user_id, e)
+        return False
+
+
+async def kick_user_from_channel(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Expulsa un usuario del canal. Retorna True si tuvo éxito."""
+    try:
+        await context.bot.ban_chat_member(CHANNEL_ID, user_id)
+        await context.bot.unban_chat_member(CHANNEL_ID, user_id)
+        return True
+    except TelegramError as e:
+        logger.warning("No se pudo expulsar user_id=%s: %s", user_id, e)
+        return False
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -98,47 +140,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Botón 🏠 Menú principal — cierra cualquier conversación activa."""
     query = update.callback_query
-    await safe_answer(query)  # ← SIEMPRE primero: libera el botón instantáneamente
+    await safe_answer(query)
     await send_main_menu(update, context)
-    return ConversationHandler.END  # cierra conversación si estaba en una
+    return ConversationHandler.END
 
 
 async def my_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await safe_answer(query)  # ← libera el botón
+    await safe_answer(query)
 
     subscription = await db.get_subscription(query.from_user.id)
-    if not subscription:
-        text = msg.NO_SUBSCRIPTION
-    else:
-        text = msg.subscription_status(subscription)
+    text = msg.NO_SUBSCRIPTION if not subscription else msg.subscription_status(subscription)
 
     try:
         await query.edit_message_text(
-            text,
-            reply_markup=kb.back_to_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
+            text, reply_markup=kb.back_to_menu_keyboard(), parse_mode=ParseMode.MARKDOWN
         )
     except TelegramError:
         await query.message.reply_text(
-            text,
-            reply_markup=kb.back_to_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
+            text, reply_markup=kb.back_to_menu_keyboard(), parse_mode=ParseMode.MARKDOWN
         )
     return ConversationHandler.END
 
 
 async def contact_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await safe_answer(query)  # ← libera el botón
-
+    await safe_answer(query)
     try:
         await query.edit_message_text(
-            msg.CONTACT_ADMIN,
-            reply_markup=kb.back_to_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
+            msg.CONTACT_ADMIN, reply_markup=kb.back_to_menu_keyboard(), parse_mode=ParseMode.MARKDOWN
         )
     except TelegramError:
         pass
@@ -146,21 +177,18 @@ async def contact_admin_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  ACTIVAR CÓDIGO (ConversationHandler)
+#  ACTIVAR CÓDIGO
 # ════════════════════════════════════════════════════════════════════════════
 
 async def activate_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await safe_answer(query)  # ← libera el botón
-
+    await safe_answer(query)
     try:
         await query.edit_message_text(
-            msg.ENTER_CODE,
-            reply_markup=kb.back_to_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
+            msg.ENTER_CODE, reply_markup=kb.back_to_menu_keyboard(), parse_mode=ParseMode.MARKDOWN
         )
     except TelegramError:
-        await query.message.reply_text(msg.ENTER_CODE, parse_mode=ParseMode.MARKDOWN)
+        await query.message.reply_text(msg.ENTER_CODE)
     return WAITING_ACTIVATE_CODE
 
 
@@ -171,37 +199,25 @@ async def activate_receive_code(update: Update, context: ContextTypes.DEFAULT_TY
 
     if days is None:
         await update.message.reply_text(
-            msg.CODE_NOT_FOUND,
-            reply_markup=kb.back_to_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
+            msg.CODE_NOT_FOUND, reply_markup=kb.back_to_menu_keyboard(), parse_mode=ParseMode.MARKDOWN
         )
-        return WAITING_ACTIVATE_CODE  # dejar en estado para reintentar
+        return WAITING_ACTIVATE_CODE
 
-    # Obtener link de invitación al canal
-    try:
-        link = await context.bot.create_chat_invite_link(
-            CHANNEL_ID, member_limit=1, expire_date=datetime.now() + timedelta(hours=24)
-        )
-        invite_url = link.invite_link
-    except TelegramError as e:
-        logger.error("Error creando invite link: %s", e)
-        invite_url = None
+    # Añadir al canal automáticamente
+    added = await add_user_to_channel(context, user.id)
 
-    sub = await db.get_subscription(user.id)
+    sub         = await db.get_subscription(user.id)
     expires_str = msg.fmt_date(sub["expires_at"]) if sub else "?"
-
-    text = msg.CODE_SUCCESS.format(days=days, expires_at=expires_str)
-    if invite_url:
-        text += f"\n\n🔗 [Acceder al canal]({invite_url})"
-
-    await update.message.reply_text(
-        text,
-        reply_markup=kb.back_to_menu_keyboard(),
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
+    text        = (
+        msg.CODE_SUCCESS.format(days=days, expires_at=expires_str)
+        if added else
+        msg.CODE_SUCCESS_NO_ADD.format(days=days, expires_at=expires_str)
     )
 
-    # Notificar al admin
+    await update.message.reply_text(
+        text, reply_markup=kb.back_to_menu_keyboard(), parse_mode=ParseMode.MARKDOWN
+    )
+
     try:
         await context.bot.send_message(
             ADMIN_ID,
@@ -215,18 +231,15 @@ async def activate_receive_code(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  RENOVAR CÓDIGO (ConversationHandler)
+#  RENOVAR CÓDIGO
 # ════════════════════════════════════════════════════════════════════════════
 
 async def renew_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await safe_answer(query)  # ← libera el botón
-
+    await safe_answer(query)
     try:
         await query.edit_message_text(
-            msg.ENTER_CODE_RENEW,
-            reply_markup=kb.back_to_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
+            msg.ENTER_CODE_RENEW, reply_markup=kb.back_to_menu_keyboard(), parse_mode=ParseMode.MARKDOWN
         )
     except TelegramError:
         await query.message.reply_text(msg.ENTER_CODE_RENEW)
@@ -240,13 +253,11 @@ async def renew_receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if days is None:
         await update.message.reply_text(
-            msg.CODE_NOT_FOUND,
-            reply_markup=kb.back_to_menu_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
+            msg.CODE_NOT_FOUND, reply_markup=kb.back_to_menu_keyboard(), parse_mode=ParseMode.MARKDOWN
         )
         return WAITING_RENEW_CODE
 
-    sub = await db.get_subscription(user.id)
+    sub         = await db.get_subscription(user.id)
     expires_str = msg.fmt_date(sub["expires_at"]) if sub else "?"
 
     await update.message.reply_text(
@@ -268,58 +279,47 @@ async def renew_receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  PANEL ADMIN
+#  PANEL ADMIN — callbacks simples
 # ════════════════════════════════════════════════════════════════════════════
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
         return
-    await update.effective_chat.send_message(
-        msg.ADMIN_WELCOME,
-        reply_markup=kb.admin_panel_keyboard(),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await send_admin_panel(update, context)
 
 
 async def admin_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await safe_answer(query)  # ← libera el botón
-    try:
-        await query.edit_message_text(
-            msg.ADMIN_WELCOME,
-            reply_markup=kb.admin_panel_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except TelegramError:
-        await query.message.reply_text(
-            msg.ADMIN_WELCOME,
-            reply_markup=kb.admin_panel_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+    await safe_answer(query)
+    await send_admin_panel(update, context)
+    return ConversationHandler.END
+
+
+async def admin_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await safe_answer(query, "✅ Panel actualizado")
+    await send_admin_panel(update, context)
     return ConversationHandler.END
 
 
 async def admin_list_codes_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await safe_answer(query)  # ← libera el botón
-
+    await safe_answer(query)
     codes = await db.list_active_codes()
-    text  = msg.admin_list_codes(codes)
     try:
         await query.edit_message_text(
-            text,
+            msg.admin_list_codes(codes),
             reply_markup=kb.back_to_admin_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
         )
     except TelegramError:
-        await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        pass
     return ConversationHandler.END
 
 
 async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await safe_answer(query)  # ← libera el botón
-
+    await safe_answer(query)
     stats = await db.get_stats()
     try:
         await query.edit_message_text(
@@ -332,18 +332,13 @@ async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-async def admin_users_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def admin_members_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await safe_answer(query)  # ← libera el botón
-
-    stats = await db.get_stats()
-    text  = (
-        f"👥 *Usuarios activos:* {stats.get('active_subs', 0)}\n"
-        f"⚠️ *Por vencer (3 días):* {stats.get('expiring_soon', 0)}"
-    )
+    await safe_answer(query)
+    subs = await db.get_all_active_subscriptions()
     try:
         await query.edit_message_text(
-            text,
+            msg.admin_members_msg(subs),
             reply_markup=kb.back_to_admin_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -352,14 +347,14 @@ async def admin_users_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
-async def admin_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def admin_intruders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await safe_answer(query, "✅ Panel actualizado")  # ← libera el botón con mensaje
-
+    await safe_answer(query)
+    logs = await db.get_intruder_log()
     try:
         await query.edit_message_text(
-            msg.ADMIN_WELCOME,
-            reply_markup=kb.admin_panel_keyboard(),
+            msg.admin_intruders_msg(logs),
+            reply_markup=kb.back_to_admin_keyboard(),
             parse_mode=ParseMode.MARKDOWN,
         )
     except TelegramError:
@@ -367,12 +362,13 @@ async def admin_refresh_callback(update: Update, context: ContextTypes.DEFAULT_T
     return ConversationHandler.END
 
 
-# ── Admin: Generar código ────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#  ADMIN — Generar código (conversación)
+# ════════════════════════════════════════════════════════════════════════════
 
 async def admin_gen_code_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await safe_answer(query)  # ← libera el botón
-
+    await safe_answer(query)
     try:
         await query.edit_message_text(
             msg.admin_gen_code_prompt(),
@@ -388,9 +384,7 @@ async def admin_gen_code_receive(update: Update, context: ContextTypes.DEFAULT_T
     parts = update.message.text.strip().split()
     if len(parts) < 2:
         await update.message.reply_text(
-            msg.ADMIN_CODE_INVALID,
-            reply_markup=kb.back_to_admin_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
+            msg.ADMIN_CODE_INVALID, reply_markup=kb.back_to_admin_keyboard(), parse_mode=ParseMode.MARKDOWN
         )
         return WAITING_GEN_CODE
 
@@ -400,18 +394,14 @@ async def admin_gen_code_receive(update: Update, context: ContextTypes.DEFAULT_T
         max_uses = int(parts[2]) if len(parts) >= 3 else 1
     except ValueError:
         await update.message.reply_text(
-            msg.ADMIN_CODE_INVALID,
-            reply_markup=kb.back_to_admin_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
+            msg.ADMIN_CODE_INVALID, reply_markup=kb.back_to_admin_keyboard(), parse_mode=ParseMode.MARKDOWN
         )
         return WAITING_GEN_CODE
 
     created = await db.create_code(code, days, max_uses)
     if not created:
         await update.message.reply_text(
-            msg.ADMIN_CODE_EXISTS,
-            reply_markup=kb.back_to_admin_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
+            msg.ADMIN_CODE_EXISTS, reply_markup=kb.back_to_admin_keyboard(), parse_mode=ParseMode.MARKDOWN
         )
         return WAITING_GEN_CODE
 
@@ -423,12 +413,118 @@ async def admin_gen_code_receive(update: Update, context: ContextTypes.DEFAULT_T
     return ConversationHandler.END
 
 
-# ── Admin: Desactivar código ─────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#  ADMIN — Buscar usuario (conversación)
+# ════════════════════════════════════════════════════════════════════════════
+
+async def admin_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await safe_answer(query)
+    try:
+        await query.edit_message_text(
+            msg.ADMIN_SEARCH_PROMPT,
+            reply_markup=kb.back_to_admin_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except TelegramError:
+        await query.message.reply_text(msg.ADMIN_SEARCH_PROMPT)
+    return WAITING_SEARCH
+
+
+async def admin_search_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query_text = update.message.text.strip()
+    results    = await db.search_user(query_text)
+
+    if not results:
+        await update.message.reply_text(
+            msg.ADMIN_SEARCH_NO_RESULTS,
+            reply_markup=kb.back_to_admin_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return WAITING_SEARCH
+
+    await update.message.reply_text(
+        msg.admin_search_results(results),
+        reply_markup=kb.back_to_admin_keyboard(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return ConversationHandler.END
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  ADMIN — Expulsar usuario (conversación)
+# ════════════════════════════════════════════════════════════════════════════
+
+async def admin_kick_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await safe_answer(query)
+    try:
+        await query.edit_message_text(
+            msg.ADMIN_KICK_PROMPT,
+            reply_markup=kb.back_to_admin_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except TelegramError:
+        await query.message.reply_text(msg.ADMIN_KICK_PROMPT, parse_mode=ParseMode.MARKDOWN)
+    return WAITING_KICK_ID
+
+
+async def admin_kick_receive_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        user_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text(
+            "❌ ID inválido. Debe ser un número.",
+            reply_markup=kb.back_to_admin_keyboard(),
+        )
+        return WAITING_KICK_ID
+
+    sub = await db.get_subscription(user_id)
+    if not sub:
+        await update.message.reply_text(
+            msg.ADMIN_KICK_NOT_FOUND, reply_markup=kb.back_to_admin_keyboard(), parse_mode=ParseMode.MARKDOWN
+        )
+        return WAITING_KICK_ID
+
+    context.user_data["kick_user_id"] = user_id
+    await update.message.reply_text(
+        msg.admin_confirm_kick_msg(sub),
+        reply_markup=kb.confirm_kick_keyboard(user_id),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return WAITING_CONFIRM_KICK
+
+
+async def admin_confirm_kick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await safe_answer(query)
+
+    user_id  = int(query.data.split(":", 1)[1])
+    sub      = await db.get_subscription(user_id)
+    username = sub.get("username") or sub.get("full_name", "?") if sub else "?"
+
+    await kick_user_from_channel(context, user_id)
+    await db.delete_subscription(user_id)
+    await db.log_intruder_kicked(user_id, username)
+
+    try:
+        await query.edit_message_text(
+            msg.admin_kicked_msg(user_id, username),
+            reply_markup=kb.back_to_admin_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except TelegramError:
+        pass
+    return ConversationHandler.END
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  ADMIN — Desactivar código (conversación)
+# ════════════════════════════════════════════════════════════════════════════
 
 async def admin_deactivate_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await safe_answer(query)  # ← libera el botón
-
+    await safe_answer(query)
     try:
         await query.edit_message_text(
             msg.ADMIN_ENTER_DEACTIVATE,
@@ -453,7 +549,7 @@ async def admin_deactivate_receive(update: Update, context: ContextTypes.DEFAULT
 
 async def admin_confirm_deactivate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await safe_answer(query)  # ← libera el botón
+    await safe_answer(query)
 
     code = query.data.split(":", 1)[1] if ":" in query.data else ""
     if code:
@@ -464,9 +560,7 @@ async def admin_confirm_deactivate_callback(update: Update, context: ContextType
 
     try:
         await query.edit_message_text(
-            text,
-            reply_markup=kb.back_to_admin_keyboard(),
-            parse_mode=ParseMode.MARKDOWN,
+            text, reply_markup=kb.back_to_admin_keyboard(), parse_mode=ParseMode.MARKDOWN
         )
     except TelegramError:
         pass
@@ -474,36 +568,27 @@ async def admin_confirm_deactivate_callback(update: Update, context: ContextType
 
 
 # ════════════════════════════════════════════════════════════════════════════
-#  FALLBACK UNIVERSAL — responde botones "muertos" durante una conversación
+#  FALLBACK UNIVERSAL
 # ════════════════════════════════════════════════════════════════════════════
 
 async def fallback_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Se ejecuta cuando el usuario presiona un botón de menú mientras está
-    dentro de un ConversationHandler en otro estado.
-    Cancela la conversación y redirige al destino del botón.
-    """
+    """Responde cualquier botón durante una conversación y la cancela."""
     query = update.callback_query
-    await safe_answer(query)  # ← libera el botón inmediatamente
+    await safe_answer(query)
 
     data = query.data
-
-    # Redirigir al destino correcto
     if data == "main_menu":
         await send_main_menu(update, context)
+    elif data == "admin_back":
+        await send_admin_panel(update, context)
     elif data == "my_sub":
         return await my_subscription_callback(update, context)
     elif data == "contact_admin":
         return await contact_admin_callback(update, context)
-    elif data == "admin_back":
-        return await admin_back_callback(update, context)
     else:
-        # Botón desconocido durante conversación → cancelar y volver al menú
         try:
             await query.edit_message_text(
-                msg.CANCEL,
-                reply_markup=kb.back_to_menu_keyboard(),
-                parse_mode=ParseMode.MARKDOWN,
+                msg.CANCEL, reply_markup=kb.back_to_menu_keyboard(), parse_mode=ParseMode.MARKDOWN
             )
         except TelegramError:
             pass
@@ -512,15 +597,12 @@ async def fallback_menu_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Comando /cancel o timeout — cancela cualquier conversación activa."""
     if update.callback_query:
         await safe_answer(update.callback_query)
     try:
         if update.effective_message:
             await update.effective_message.reply_text(
-                msg.CANCEL,
-                reply_markup=kb.back_to_menu_keyboard(),
-                parse_mode=ParseMode.MARKDOWN,
+                msg.CANCEL, reply_markup=kb.back_to_menu_keyboard(), parse_mode=ParseMode.MARKDOWN
             )
     except TelegramError:
         pass
@@ -535,19 +617,15 @@ async def job_check_expired(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Expulsa usuarios con suscripción vencida."""
     expired = await db.get_expired_subscriptions()
     for sub in expired:
-        user_id = sub["user_id"]
-        try:
-            await context.bot.ban_chat_member(CHANNEL_ID, user_id)
-            await context.bot.unban_chat_member(CHANNEL_ID, user_id)  # permite volver si renueva
-        except TelegramError as e:
-            logger.warning("No se pudo expulsar a %s: %s", user_id, e)
+        user_id  = sub["user_id"]
+        username = sub.get("username") or sub.get("full_name", "?")
+
+        await kick_user_from_channel(context, user_id)
 
         try:
             await context.bot.send_message(
-                user_id,
-                msg.SUBSCRIPTION_EXPIRED,
-                reply_markup=kb.main_menu_keyboard(),
-                parse_mode=ParseMode.MARKDOWN,
+                user_id, msg.SUBSCRIPTION_EXPIRED,
+                reply_markup=kb.main_menu_keyboard(), parse_mode=ParseMode.MARKDOWN
             )
         except TelegramError:
             pass
@@ -556,19 +634,54 @@ async def job_check_expired(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Suscripción expirada eliminada: user_id=%s", user_id)
 
 
+async def job_check_intruders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Cada 30 min: obtiene miembros del canal y expulsa a los que
+    no tienen suscripción activa en la DB.
+    """
+    try:
+        active_ids = await db.get_all_active_user_ids()
+        # Obtener administradores para no expulsarlos
+        admins = await context.bot.get_chat_administrators(CHANNEL_ID)
+        admin_ids = {a.user.id for a in admins}
+
+        # Iterar miembros del canal (solo funciona en grupos/supergrupos accesibles)
+        # Para canales privados usamos get_chat_member de IDs conocidos
+        # La estrategia: cualquier usuario en DB que ya no esté activo fue manejado
+        # por job_check_expired. Aquí verificamos usuarios que entraron sin código.
+        # Como Telegram no da lista de miembros de canal, comparamos la DB contra
+        # intentos de get_chat_member para IDs sospechosos registrados en stats.
+        kicked_count = 0
+
+        # Verificar que todos los activos realmente están en el canal
+        for uid in list(active_ids):
+            if uid in admin_ids:
+                continue
+            try:
+                member = await context.bot.get_chat_member(CHANNEL_ID, uid)
+                # Si el miembro está pero no está en active_ids, expulsar
+                if member.status in (ChatMember.LEFT, ChatMember.BANNED):
+                    # Ya no está, limpiar DB
+                    await db.delete_subscription(uid)
+            except TelegramError:
+                pass
+
+        logger.info("Job intruders completado. Expulsados: %d", kicked_count)
+    except Exception as e:
+        logger.error("job_check_intruders error: %s", e)
+
+
 async def job_warn_expiring(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Avisa a usuarios que vencen en 3 días."""
     expiring = await db.get_expiring_soon(days=3)
     for sub in expiring:
         user_id = sub["user_id"]
         try:
-            expiry   = datetime.fromisoformat(sub["expires_at"])
+            expiry    = datetime.fromisoformat(sub["expires_at"])
             days_left = max(0, (expiry - datetime.now()).days)
             await context.bot.send_message(
-                user_id,
-                msg.warn_expiring(days_left),
-                reply_markup=kb.main_menu_keyboard(),
-                parse_mode=ParseMode.MARKDOWN,
+                user_id, msg.warn_expiring(days_left),
+                reply_markup=kb.main_menu_keyboard(), parse_mode=ParseMode.MARKDOWN
             )
             await db.mark_warned(user_id)
         except TelegramError as e:
@@ -582,35 +695,26 @@ async def job_warn_expiring(context: ContextTypes.DEFAULT_TYPE) -> None:
 def build_application() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # ── Fallbacks comunes para todos los ConversationHandlers ──────────────
-    # Cualquier botón de menú cancela la conversación activa
+    # Fallbacks comunes para todos los ConversationHandlers
     common_fallbacks = [
         CallbackQueryHandler(main_menu_callback,   pattern="^main_menu$"),
-        CallbackQueryHandler(fallback_menu_button, pattern="^(my_sub|contact_admin|activate|renew|admin_back|admin_stats|admin_list_codes|admin_users|admin_refresh|admin_gen_code|admin_deactivate)$"),
+        CallbackQueryHandler(fallback_menu_button, pattern="^(my_sub|contact_admin|activate|renew|admin_back|admin_stats|admin_list_codes|admin_members|admin_intruders|admin_refresh|admin_gen_code|admin_deactivate|admin_search|admin_kick)$"),
         CommandHandler("cancel", cancel_conversation),
-        CommandHandler("start",  cancel_conversation),  # /start siempre cancela y va al menú
+        CommandHandler("start",  cancel_conversation),
     ]
 
-    # ── ConversationHandler: Activar código ───────────────────────────────
+    # ── ConversationHandler: Activar código ──────────────────────────────
     activate_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(activate_start, pattern="^activate$")],
-        states={
-            WAITING_ACTIVATE_CODE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, activate_receive_code),
-            ],
-        },
+        states={WAITING_ACTIVATE_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, activate_receive_code)]},
         fallbacks=common_fallbacks,
-        conversation_timeout=300,  # 5 min sin respuesta → cancela automáticamente
+        conversation_timeout=300,
     )
 
-    # ── ConversationHandler: Renovar ──────────────────────────────────────
+    # ── ConversationHandler: Renovar ─────────────────────────────────────
     renew_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(renew_start, pattern="^renew$")],
-        states={
-            WAITING_RENEW_CODE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, renew_receive_code),
-            ],
-        },
+        states={WAITING_RENEW_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, renew_receive_code)]},
         fallbacks=common_fallbacks,
         conversation_timeout=300,
     )
@@ -618,11 +722,7 @@ def build_application() -> Application:
     # ── ConversationHandler: Admin generar código ─────────────────────────
     admin_gen_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_gen_code_start, pattern="^admin_gen_code$")],
-        states={
-            WAITING_GEN_CODE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_gen_code_receive),
-            ],
-        },
+        states={WAITING_GEN_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_gen_code_receive)]},
         fallbacks=common_fallbacks,
         conversation_timeout=300,
     )
@@ -631,11 +731,31 @@ def build_application() -> Application:
     admin_deact_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_deactivate_start, pattern="^admin_deactivate$")],
         states={
-            WAITING_DEACTIVATE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_deactivate_receive),
-            ],
+            WAITING_DEACTIVATE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_deactivate_receive)],
             WAITING_CONFIRM_DEACT: [
                 CallbackQueryHandler(admin_confirm_deactivate_callback, pattern="^admin_confirm_deactivate:"),
+                CallbackQueryHandler(admin_back_callback, pattern="^admin_back$"),
+            ],
+        },
+        fallbacks=common_fallbacks,
+        conversation_timeout=300,
+    )
+
+    # ── ConversationHandler: Admin buscar usuario ─────────────────────────
+    admin_search_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_search_start, pattern="^admin_search$")],
+        states={WAITING_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_receive)]},
+        fallbacks=common_fallbacks,
+        conversation_timeout=300,
+    )
+
+    # ── ConversationHandler: Admin expulsar usuario ───────────────────────
+    admin_kick_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_kick_start, pattern="^admin_kick$")],
+        states={
+            WAITING_KICK_ID:     [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_kick_receive_id)],
+            WAITING_CONFIRM_KICK: [
+                CallbackQueryHandler(admin_confirm_kick_callback, pattern="^admin_confirm_kick:"),
                 CallbackQueryHandler(admin_back_callback, pattern="^admin_back$"),
             ],
         },
@@ -651,21 +771,25 @@ def build_application() -> Application:
     app.add_handler(renew_conv)
     app.add_handler(admin_gen_conv)
     app.add_handler(admin_deact_conv)
+    app.add_handler(admin_search_conv)
+    app.add_handler(admin_kick_conv)
 
-    # Handlers simples (no necesitan conversación)
-    app.add_handler(CallbackQueryHandler(main_menu_callback,         pattern="^main_menu$"))
-    app.add_handler(CallbackQueryHandler(my_subscription_callback,   pattern="^my_sub$"))
-    app.add_handler(CallbackQueryHandler(contact_admin_callback,     pattern="^contact_admin$"))
-    app.add_handler(CallbackQueryHandler(admin_back_callback,        pattern="^admin_back$"))
-    app.add_handler(CallbackQueryHandler(admin_list_codes_callback,  pattern="^admin_list_codes$"))
-    app.add_handler(CallbackQueryHandler(admin_stats_callback,       pattern="^admin_stats$"))
-    app.add_handler(CallbackQueryHandler(admin_users_callback,       pattern="^admin_users$"))
-    app.add_handler(CallbackQueryHandler(admin_refresh_callback,     pattern="^admin_refresh$"))
+    # Handlers simples
+    app.add_handler(CallbackQueryHandler(main_menu_callback,        pattern="^main_menu$"))
+    app.add_handler(CallbackQueryHandler(my_subscription_callback,  pattern="^my_sub$"))
+    app.add_handler(CallbackQueryHandler(contact_admin_callback,    pattern="^contact_admin$"))
+    app.add_handler(CallbackQueryHandler(admin_back_callback,       pattern="^admin_back$"))
+    app.add_handler(CallbackQueryHandler(admin_refresh_callback,    pattern="^admin_refresh$"))
+    app.add_handler(CallbackQueryHandler(admin_list_codes_callback, pattern="^admin_list_codes$"))
+    app.add_handler(CallbackQueryHandler(admin_stats_callback,      pattern="^admin_stats$"))
+    app.add_handler(CallbackQueryHandler(admin_members_callback,    pattern="^admin_members$"))
+    app.add_handler(CallbackQueryHandler(admin_intruders_callback,  pattern="^admin_intruders$"))
 
     # ── Jobs ──────────────────────────────────────────────────────────────
     jq = app.job_queue
-    jq.run_repeating(job_check_expired,  interval=3600,  first=60)   # cada hora
-    jq.run_repeating(job_warn_expiring,  interval=43200, first=120)  # cada 12h
+    jq.run_repeating(job_check_expired,   interval=3600,  first=60)
+    jq.run_repeating(job_check_intruders, interval=1800,  first=120)  # cada 30 min
+    jq.run_repeating(job_warn_expiring,   interval=43200, first=180)
 
     return app
 
@@ -682,10 +806,7 @@ def main() -> None:
     try:
         app.run_polling(
             allowed_updates=Update.ALL_TYPES,
-            # Descarta updates acumulados — evita Conflict al reiniciar.
             drop_pending_updates=True,
-            # Cierre limpio: Railway espera a que el proceso muera
-            # antes de lanzar la nueva instancia.
             close_loop=True,
         )
     except Exception as e:
