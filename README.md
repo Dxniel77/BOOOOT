@@ -1,26 +1,32 @@
-# 💎 DX VIP Bot
+# 💎 VIP Bot — Canal Exclusivo Premium
 
 > Bot de suscripción premium para canal privado de Telegram.
-> Gestión completa de membresías, referidos, blacklist, broadcast y auditoría.
+> Gestión completa de membresías, tickets de soporte, ruleta semanal, ranking y Mini App.
+>
+> **Desarrollado por DX**
 
 ---
 
-## ✨ Características completas
+## ✨ Funciones completas
 
 ### 👤 Experiencia de usuario
+
 | Función | Descripción |
 |---|---|
 | 🔑 Activar código | Accede al canal privado con un código VIP |
 | 🔄 Renovar acceso | Suma días a una suscripción activa |
-| 💎 Tarjeta de membresía | Visualización premium con barra de progreso con color semántico (verde/amarillo/rojo) |
+| 💎 Mi membresía | Tarjeta visual con barra de progreso semántica (🟢🟡🔴) |
+| 💎 Ver tarjeta VIP | Abre la Mini App con countdown en tiempo real |
 | 🎁 Prueba gratis | 2 días de acceso gratuito (1 uso por usuario de por vida) |
-| 🔗 Sistema de referidos | Link personalizado; cada referido exitoso regala +7 días al referidor |
-| 👥 Mis referidos | Historial de personas referidas y días ganados |
+| 🎰 Ruleta semanal | Gira una vez por semana y gana 1–7 días extra |
+| 🎟️ Soporte | Abre tickets de soporte con respuesta del admin |
+| 📋 Mis tickets | Historial de tickets y conversaciones |
 | 📜 Mi historial | Actividad completa del usuario en el bot |
-| 💬 Auto-respuesta | El bot responde inteligentemente a mensajes de texto libre |
-| 🚫 Blacklist | Usuarios baneados no pueden interactuar con el bot |
+| 💬 Auto-respuesta | El bot responde mensajes de texto libre |
+| 🚫 Blacklist | Usuarios baneados no pueden interactuar |
 
 ### 🛠️ Panel de administración
+
 | Función | Comando/Botón |
 |---|---|
 | Panel completo | `/admin` |
@@ -30,8 +36,11 @@
 | Listar todos los códigos | Panel → Listar códigos |
 | Estadísticas con gráficos ASCII | Panel → Estadísticas |
 | Miembros activos con estado 🟢🟡🔴 | Panel → Miembros activos |
-| Buscar usuario | Por ID, @username o nombre |
-| Expulsar usuario | Con confirmación de seguridad |
+| Ranking top 10 miembros | Panel → Ranking |
+| Tickets de soporte abiertos | Panel → Tickets soporte |
+| Responder tickets | Panel → Tickets → Ver ticket → Responder |
+| Cerrar / Reabrir tickets | Panel → Tickets → Acciones |
+| Expulsar usuario | Panel → Miembros → Expulsar |
 | Banear usuario | Panel → Blacklist → Banear |
 | Desbanear usuario | Panel → Blacklist → Desbanear |
 | `/ban USER_ID [razón]` | Comando directo |
@@ -39,19 +48,31 @@
 | `/adddays USER_ID DIAS` | Añadir días sin código |
 | Broadcast masivo | Con preview + confirmación |
 | Historial de broadcasts | Panel → Mantenimiento |
-| Intrusos detectados | Scan de canal privado |
 | Limpieza forzada de vencidos | Panel → Mantenimiento |
-| Backup de DB | Envía el archivo `.db` al admin |
-| Log de auditoría | Cada acción admin queda registrada |
+| Backup de DB | Panel → Mantenimiento → Backup |
+| Log de auditoría | Panel → Mantenimiento → Auditoría |
 
-### 🤖 Automatizaciones (Jobs)
+### 🤖 Jobs automáticos
+
 | Job | Frecuencia | Función |
 |---|---|---|
 | Limpieza vencidos | Cada hora | Expulsa del canal y notifica |
-| Scan de intrusos | Cada 30 min | Detecta fantasmas / intrusos |
-| Aviso 3 días | Cada 12h | Notifica si vence en ≤3 días |
-| Aviso 1 día | Cada 12h | Notifica si vence en ≤24h |
+| Aviso vencimiento | Cada 12h | Notifica si vence en ≤3 días o ≤24h |
 | Resumen diario | 08:00 UTC | Estadísticas del día al admin |
+
+---
+
+## 💎 Mini App de Telegram
+
+La Mini App se abre pulsando **"💎 Ver tarjeta VIP"** dentro del bot (solo si tienes membresía activa).
+
+- URL registrada: `https://t.me/subv1bot/membresia`
+- Hosted en: `https://dxniel77.github.io/botFF/`
+- Diseño luxury oscuro con tipografía premium
+- Countdown en tiempo real (días, horas, minutos, segundos)
+- Barra de progreso semántica con colores
+- Banner de alerta automático si quedan ≤3 días
+- Ticker tape rojo en estado crítico (≤24h)
 
 ---
 
@@ -63,6 +84,7 @@
 ├── database.py      ← Capa de datos async (SQLite + WAL)
 ├── keyboards.py     ← Todos los InlineKeyboardMarkup
 ├── messages.py      ← Todos los textos con diseño premium
+├── miniapp_index.html ← Mini App (subir a GitHub Pages)
 ├── requirements.txt
 ├── Dockerfile
 └── railway.toml
@@ -70,17 +92,19 @@
 
 ---
 
-## 🗃️ Esquema de la base de datos
+## 🗃️ Base de datos
 
 | Tabla | Descripción |
 |---|---|
 | `codes` | Códigos VIP con usos, días, nota y estado |
-| `subscriptions` | Membresías activas con fechas, renovaciones y referido |
+| `subscriptions` | Membresías activas con fechas y renovaciones |
 | `blacklist` | Usuarios baneados permanentemente |
-| `referrals` | Registro de referidos y bonus entregados |
 | `free_trials` | Registro de pruebas gratuitas usadas |
+| `support_tickets` | Tickets de soporte con estado |
+| `ticket_messages` | Mensajes de conversación por ticket |
+| `ruleta_log` | Historial de ruletas jugadas |
 | `stats` | Log de todos los eventos del bot |
-| `audit_log` | Log de todas las acciones del administrador |
+| `audit_log` | Log de todas las acciones del admin |
 | `broadcast_log` | Historial de broadcasts con resultados |
 
 ---
@@ -94,27 +118,20 @@
 | `CHANNEL_ID` | ID del canal privado | `-100123456789` |
 | `DB_DIR` | Directorio de la DB (volumen Railway) | `/data` |
 
+> `MINIAPP_URL` está hardcodeado en `bot.py` como `https://dxniel77.github.io/botFF/`
+
 ---
 
 ## 🚀 Deploy en Railway
 
-### 1. Preparar el repositorio
+### 1. Subir archivos a GitHub
 ```bash
-git init
 git add .
-git commit -m "DX VIP Bot - Initial deploy"
+git commit -m "VIP Bot - update"
+git push
 ```
 
-### 2. Crear proyecto en Railway
-1. Ve a [railway.app](https://railway.app) → New Project → Deploy from GitHub
-2. Conecta tu repositorio
-
-### 3. Añadir volumen persistente
-1. En Railway: tu servicio → **Volumes** → **Add Volume**
-2. Mount path: `/data`
-
-### 4. Configurar variables de entorno
-En Railway → Variables:
+### 2. Variables en Railway
 ```
 BOT_TOKEN=tu_token_aqui
 ADMIN_ID=tu_id_aqui
@@ -122,103 +139,70 @@ CHANNEL_ID=id_del_canal_aqui
 DB_DIR=/data
 ```
 
-### 5. Deploy automático
-Railway detecta el `Dockerfile` y despliega automáticamente.
+### 3. Volumen persistente
+Railway → tu servicio → **Volumes** → **Add Volume** → Mount path: `/data`
+
+### 4. Deploy automático
+Railway detecta el `Dockerfile` y despliega automáticamente al hacer push.
 
 ---
 
 ## 📝 Guía de códigos
 
-### Formato al generar desde el panel admin
-
-```
+```bash
 # Código aleatorio (genera VIP-XXXXXX)
 30 5          →  30 días, 5 usos
 
 # Código personalizado
 BLACK30 30 1  →  código BLACK30, 30 días, 1 uso
 
-# Con nota descriptiva
+# Con nota
 PROMO7 7 10 LanzamientoJulio  →  código con nota
 ```
 
-### Ejemplos de códigos generados
-```
-VIP-XK9F2M   (aleatorio)
-VIP-A3PQ7R   (aleatorio)
-BLACK30       (personalizado)
-PROMO7        (personalizado)
-```
+---
+
+## 🎰 Ruleta semanal
+
+- Disponible una vez cada 7 días por usuario
+- Solo para usuarios con membresía activa
+- Premios: 1 · 1 · 2 · 2 · 3 · 3 · 3 · 5 · 5 · 7 días (ponderado)
+- Los días ganados se suman automáticamente a la membresía
 
 ---
 
-## 🎨 Mejoras visuales implementadas
+## 🎟️ Sistema de soporte
 
-- **Separadores premium** `━━━━━━━━━━━━━━━━━━━━━━━━` en todos los mensajes
-- **Tarjeta de membresía** estilo visual con barra de progreso y estado semántico
-- **Colores de estado**: 🟢 Activa / 🟡 Pronto vence / 🔴 Crítica
-- **Gráficos ASCII** en estadísticas admin con barras proporcionales
-- **Emojis ricos** consistentes en toda la interfaz
-- **Bienvenida personalizada** con el nombre del usuario
+- El usuario abre un ticket desde el menú principal
+- El admin recibe notificación inmediata con botón de respuesta
+- Conversación bidireccional con historial completo
+- Estado: abierto / cerrado (ambos pueden cambiar el estado)
+- Admin puede gestionar todos los tickets desde `/admin` → Tickets
 
 ---
 
-## 💡 Mejoras visuales adicionales que puedes hacer
+## 🏆 Ranking (solo admin)
 
-### En BotFather (sin código)
-- Sube una **foto de perfil** al bot: logo 640×640px con fondo oscuro y letras doradas
-- Configura la **descripción corta**: `"Canal VIP Exclusivo · Activa tu acceso aquí 💎"`
-- Configura los **comandos visibles**:
-  ```
-  start - Menú principal
-  admin - Panel de administración
-  adddays - Añadir días a usuario
-  ban - Banear usuario
-  unban - Desbanear usuario
-  ```
-
-### Banner de bienvenida (mejora opcional)
-Puedes reemplazar el mensaje de bienvenida por una **foto + caption**:
-```python
-# En start_handler, cambiar reply_text por:
-await update.message.reply_photo(
-    photo="URL_O_FILE_ID_DEL_BANNER",
-    caption=msg.welcome(user.first_name),
-    reply_markup=kb.main_menu(),
-    parse_mode=ParseMode.MARKDOWN,
-)
-```
-Diseña el banner en Canva: **1280×640px**, fondo oscuro, tipografía dorada, logo del canal.
-
-### Mini App de Telegram (próximo nivel)
-Para una experiencia de app móvil completa con gráficos reales,
-historial visual y panel admin interactivo, se puede desarrollar
-una **Telegram Web App** (HTML/CSS/JS) que se abre dentro del bot.
+- Top 10 miembros por días acumulados totales
+- Accesible desde `/admin` → Ranking
+- Medallas 🥇🥈🥉🏅
 
 ---
 
 ## 🔒 Seguridad
 
-- ✅ Blacklist permanente: los baneados no pueden interactuar
-- ✅ Verificación en cada callback: el admin_id se valida en cada operación
-- ✅ Auditoría completa: toda acción del admin queda registrada con timestamp
-- ✅ Anti-colisión en códigos: bucle de 30 intentos + fallback con `secrets.token_hex`
-- ✅ Timeout de conversaciones: 5 minutos de inactividad cancela automáticamente
-- ✅ `drop_pending_updates=True`: evita conflictos al reiniciar
-- ✅ SQLite WAL mode: escrituras concurrentes seguras
-
----
-
-## 📜 Licencia
-
-Proyecto privado. Todos los derechos reservados.
+- ✅ Blacklist permanente
+- ✅ Verificación admin en cada operación
+- ✅ Auditoría completa con timestamp
+- ✅ Anti-colisión en códigos (30 intentos + fallback)
+- ✅ Timeout de conversaciones: 5 minutos
+- ✅ `drop_pending_updates=True`
+- ✅ SQLite WAL mode
 
 ---
 
 <div align="center">
 
-**Desarrollado con 💎 por DX**
-
-*DX VIP Bot · Canal Exclusivo Premium*
+**Desarrollado por DX · Canal VIP Exclusivo Premium**
 
 </div>
