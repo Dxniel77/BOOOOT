@@ -17,8 +17,10 @@ def main_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔄 Renovar acceso",  callback_data="renew"),
         ],
         [
-            InlineKeyboardButton("💎 Mi membresía",    web_app=WebAppInfo(url=MINIAPP_URL)),
-            InlineKeyboardButton("🎁 Prueba gratis",   callback_data="free_trial"),
+            InlineKeyboardButton("💎 Mi membresía VIP", web_app=WebAppInfo(url=MINIAPP_URL)),
+        ],
+        [
+            InlineKeyboardButton("🎁 Prueba gratis 30d", callback_data="free_trial"),
         ],
         [
             InlineKeyboardButton("🎟️ Soporte",         callback_data="support"),
