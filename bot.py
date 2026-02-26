@@ -6,13 +6,19 @@ Funciones: activar código, renovar, membresía (Mini App directa),
 Sin ruleta semanal.
 """
 
+import hashlib
+import hmac
 import io
+import json
 import logging
 import os
 import random
 import secrets
 import string
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qsl, unquote
+
+from aiohttp import web
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -40,6 +46,87 @@ BOT_TOKEN  = os.getenv("BOT_TOKEN")
 ADMIN_ID   = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003738953503"))
 FREE_TRIAL_DAYS = 30
+API_PORT = int(os.getenv("API_PORT", "8080"))
+
+
+# ──────────────────────────────────────────────────────────────
+# HTTP API SERVER (para Mini App)
+# ──────────────────────────────────────────────────────────────
+def verify_telegram_init_data(init_data: str, bot_token: str) -> dict | None:
+    """Verifica la firma de Telegram initData y retorna el user dict o None."""
+    try:
+        params = dict(parse_qsl(init_data, keep_blank_values=True))
+        hash_val = params.pop("hash", "")
+        data_check = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
+        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+        computed = hmac.new(secret_key, data_check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(computed, hash_val):
+            return None
+        user_str = params.get("user", "{}")
+        return json.loads(unquote(user_str))
+    except Exception:
+        return None
+
+
+async def api_user_info(request: web.Request) -> web.Response:
+    cors_headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    }
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=cors_headers)
+
+    init_data = request.rel_url.query.get("initData", "")
+    if not init_data:
+        return web.json_response({"error": "missing initData"}, status=400, headers=cors_headers)
+
+    user = verify_telegram_init_data(init_data, BOT_TOKEN or "")
+    if not user:
+        # En desarrollo permitimos user_id directo para pruebas
+        try:
+            uid = int(request.rel_url.query.get("user_id", "0"))
+            if uid == 0:
+                return web.json_response({"error": "unauthorized"}, status=401, headers=cors_headers)
+        except ValueError:
+            return web.json_response({"error": "unauthorized"}, status=401, headers=cors_headers)
+    else:
+        uid = user.get("id", 0)
+
+    sub = await db.get_subscription(uid)
+    if not sub:
+        return web.json_response({
+            "has_membership": False,
+            "user_id": uid,
+            "first_name": user.get("first_name", "") if user else "",
+        }, headers=cors_headers)
+
+    expiry_dt = datetime.strptime(sub["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    now_dt = datetime.now(timezone.utc)
+    seconds_left = max(0, int((expiry_dt - now_dt).total_seconds()))
+
+    return web.json_response({
+        "has_membership": True,
+        "user_id": uid,
+        "first_name": sub["first_name"] or (user.get("first_name", "") if user else ""),
+        "username": sub["username"] or "",
+        "expiry": sub["expiry"],
+        "expires_at_ts": int(expiry_dt.timestamp() * 1000),  # ms para JS
+        "seconds_left": seconds_left,
+        "total_days": sub["total_days"] or 0,
+        "is_expired": now_dt > expiry_dt,
+    }, headers=cors_headers)
+
+
+async def start_api_server():
+    app_http = web.Application()
+    app_http.router.add_route("GET",     "/api/user_info", api_user_info)
+    app_http.router.add_route("OPTIONS", "/api/user_info", api_user_info)
+    runner = web.AppRunner(app_http)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", API_PORT)
+    await site.start()
+    logger.info(f"🌐 API HTTP corriendo en :{API_PORT}")
 
 # ── States ──
 (
@@ -936,139 +1023,161 @@ async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────────
 def main():
     import asyncio
-    asyncio.get_event_loop().run_until_complete(db.init_db())
 
-    if not BOT_TOKEN:
-        logger.critical("BOT_TOKEN no configurado. Saliendo.")
-        return
+    async def _run():
+        await db.init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+        if not BOT_TOKEN:
+            logger.critical("BOT_TOKEN no configurado. Saliendo.")
+            return
 
-    # ── Conversations ──
-    convs = [
-        ConversationHandler(
-            entry_points=[CallbackQueryHandler(activate_start, pattern="^activate$")],
-            states={STATE_ACTIVATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, activate_code)]},
-            fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^main_menu$")], conversation_timeout=300
-        ),
-        ConversationHandler(
-            entry_points=[CallbackQueryHandler(renew_start, pattern="^renew$")],
-            states={STATE_RENEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, renew_code)]},
-            fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^main_menu$")], conversation_timeout=300
-        ),
-        ConversationHandler(
-            entry_points=[CallbackQueryHandler(adm_gen_code_menu, pattern="^adm_gen_code$")],
-            states={STATE_GEN_CODE: [
-                CallbackQueryHandler(adm_gen_code_quick, pattern="^adm_quick_"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_gen_code_input)
-            ]},
-            fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
-        ),
-        ConversationHandler(
-            entry_points=[CallbackQueryHandler(adm_ban_input_start, pattern="^adm_ban_input$")],
-            states={STATE_BAN_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ban_input_received)]},
-            fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
-        ),
-        ConversationHandler(
-            entry_points=[
-                CallbackQueryHandler(adm_broadcast_segment, pattern="^adm_bc_"),
-            ],
-            states={STATE_BROADCAST_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_broadcast_preview)]},
-            fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
-        ),
-        ConversationHandler(
-            entry_points=[CallbackQueryHandler(ticket_new_start, pattern="^ticket_new$")],
-            states={
-                STATE_TICKET_SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_subject_received)],
-                STATE_TICKET_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_message_received)],
-            },
-            fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^main_menu$")], conversation_timeout=300
-        ),
-        ConversationHandler(
-            entry_points=[CallbackQueryHandler(ticket_reply_start, pattern="^ticket_reply_")],
-            states={STATE_TICKET_REPLY_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_reply_user_message)]},
-            fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^main_menu$")], conversation_timeout=300
-        ),
-        ConversationHandler(
-            entry_points=[CallbackQueryHandler(adm_ticket_reply_start, pattern="^adm_ticket_reply_")],
-            states={STATE_ADM_TICKET_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ticket_reply_message)]},
-            fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
-        ),
-        ConversationHandler(
-            entry_points=[CallbackQueryHandler(adm_add_admin_start, pattern="^adm_add_admin$")],
-            states={STATE_ADD_ADMIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_admin_received)]},
-            fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
-        ),
-        ConversationHandler(
-            entry_points=[CallbackQueryHandler(adm_remove_admin_start, pattern="^adm_remove_admin$")],
-            states={STATE_REMOVE_ADMIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_remove_admin_received)]},
-            fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
-        ),
-    ]
-    for conv in convs:
-        app.add_handler(conv)
+        # Arrancar servidor HTTP API
+        await start_api_server()
 
-    # ── Comandos ──
-    for cmd, fn in [
-        ("start",        start_handler),
-        ("admin",        admin_command),
-        ("ban",          ban_command),
-        ("unban",        unban_command),
-        ("adddays",      adddays_command),
-        ("addadmin",     addadmin_command),
-        ("removeadmin",  removeadmin_command),
-    ]:
-        app.add_handler(CommandHandler(cmd, fn))
+        app = Application.builder().token(BOT_TOKEN).build()
 
-    # ── Callbacks ──
-    callbacks = [
-        ("^main_menu$",            main_menu_callback),
-        ("^free_trial$",           free_trial_callback),
-        ("^history$",              history_callback),
-        ("^support$",              support_callback),
-        ("^ticket_list$",          ticket_list_callback),
-        ("^ticket_view_",          ticket_view_callback),
-        ("^ticket_close_",         ticket_close_user),
-        ("^ticket_reopen_",        ticket_reopen_user),
-        ("^adm_panel$",            admin_panel_callback),
-        ("^adm_list_codes$",       adm_list_codes),
-        ("^adm_members$",          adm_members),
-        ("^adm_stats$",            adm_stats),
-        ("^adm_ranking$",          adm_ranking),
-        ("^adm_admins$",           adm_admins),
-        ("^adm_list_admins$",      adm_list_admins),
-        ("^adm_blacklist$",        adm_blacklist),
-        ("^adm_blacklist_list$",   adm_blacklist_list),
-        ("^adm_broadcast$",        adm_broadcast),
-        ("^adm_broadcast_confirm$",adm_broadcast_confirm),
-        ("^adm_maintenance$",      adm_maintenance),
-        ("^adm_clean_expired$",    adm_clean_expired),
-        ("^adm_export_csv$",       adm_export_csv),
-        ("^adm_backup$",           adm_backup),
-        ("^adm_audit_log$",        adm_audit_log),
-        ("^adm_broadcast_history$",adm_broadcast_history),
-        ("^adm_scan_intruders$",   adm_scan_intruders),
-        ("^adm_tickets$",          adm_tickets),
-        ("^adm_tickets_open$",     adm_tickets_open),
-        ("^adm_tickets_all$",      adm_tickets_all),
-        ("^adm_tview_",            adm_ticket_view),
-        ("^adm_ticket_close_",     adm_ticket_close),
-        ("^adm_ticket_reopen_",    adm_ticket_reopen),
-    ]
-    for pattern, fn in callbacks:
-        app.add_handler(CallbackQueryHandler(fn, pattern=pattern))
+        # ── Conversations ──
+        convs = [
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(activate_start, pattern="^activate$")],
+                states={STATE_ACTIVATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, activate_code)]},
+                fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^main_menu$")], conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(renew_start, pattern="^renew$")],
+                states={STATE_RENEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, renew_code)]},
+                fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^main_menu$")], conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_gen_code_menu, pattern="^adm_gen_code$")],
+                states={STATE_GEN_CODE: [
+                    CallbackQueryHandler(adm_gen_code_quick, pattern="^adm_quick_"),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, adm_gen_code_input)
+                ]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_ban_input_start, pattern="^adm_ban_input$")],
+                states={STATE_BAN_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ban_input_received)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[
+                    CallbackQueryHandler(adm_broadcast_segment, pattern="^adm_bc_"),
+                ],
+                states={STATE_BROADCAST_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_broadcast_preview)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(ticket_new_start, pattern="^ticket_new$")],
+                states={
+                    STATE_TICKET_SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_subject_received)],
+                    STATE_TICKET_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_message_received)],
+                },
+                fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^main_menu$")], conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(ticket_reply_start, pattern="^ticket_reply_")],
+                states={STATE_TICKET_REPLY_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_reply_user_message)]},
+                fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^main_menu$")], conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_ticket_reply_start, pattern="^adm_ticket_reply_")],
+                states={STATE_ADM_TICKET_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ticket_reply_message)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_add_admin_start, pattern="^adm_add_admin$")],
+                states={STATE_ADD_ADMIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_admin_received)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_remove_admin_start, pattern="^adm_remove_admin$")],
+                states={STATE_REMOVE_ADMIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_remove_admin_received)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
+            ),
+        ]
+        for conv in convs:
+            app.add_handler(conv)
 
-    # ── Auto-respuesta ──
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_reply))
+        # ── Comandos ──
+        for cmd, fn in [
+            ("start",        start_handler),
+            ("admin",        admin_command),
+            ("ban",          ban_command),
+            ("unban",        unban_command),
+            ("adddays",      adddays_command),
+            ("addadmin",     addadmin_command),
+            ("removeadmin",  removeadmin_command),
+        ]:
+            app.add_handler(CommandHandler(cmd, fn))
 
-    # ── Jobs ──
-    jq: JobQueue = app.job_queue
-    jq.run_repeating(job_clean_expired, interval=3600,  first=60)
-    jq.run_repeating(job_warn_expiring, interval=43200, first=120)
-    jq.run_daily(job_daily_summary, time=datetime.strptime("08:00", "%H:%M").time())
+        # ── Callbacks ──
+        callbacks = [
+            ("^main_menu$",            main_menu_callback),
+            ("^free_trial$",           free_trial_callback),
+            ("^history$",              history_callback),
+            ("^support$",              support_callback),
+            ("^ticket_list$",          ticket_list_callback),
+            ("^ticket_view_",          ticket_view_callback),
+            ("^ticket_close_",         ticket_close_user),
+            ("^ticket_reopen_",        ticket_reopen_user),
+            ("^adm_panel$",            admin_panel_callback),
+            ("^adm_list_codes$",       adm_list_codes),
+            ("^adm_members$",          adm_members),
+            ("^adm_stats$",            adm_stats),
+            ("^adm_ranking$",          adm_ranking),
+            ("^adm_admins$",           adm_admins),
+            ("^adm_list_admins$",      adm_list_admins),
+            ("^adm_blacklist$",        adm_blacklist),
+            ("^adm_blacklist_list$",   adm_blacklist_list),
+            ("^adm_broadcast$",        adm_broadcast),
+            ("^adm_broadcast_confirm$",adm_broadcast_confirm),
+            ("^adm_maintenance$",      adm_maintenance),
+            ("^adm_clean_expired$",    adm_clean_expired),
+            ("^adm_export_csv$",       adm_export_csv),
+            ("^adm_backup$",           adm_backup),
+            ("^adm_audit_log$",        adm_audit_log),
+            ("^adm_broadcast_history$",adm_broadcast_history),
+            ("^adm_scan_intruders$",   adm_scan_intruders),
+            ("^adm_tickets$",          adm_tickets),
+            ("^adm_tickets_open$",     adm_tickets_open),
+            ("^adm_tickets_all$",      adm_tickets_all),
+            ("^adm_tview_",            adm_ticket_view),
+            ("^adm_ticket_close_",     adm_ticket_close),
+            ("^adm_ticket_reopen_",    adm_ticket_reopen),
+        ]
+        for pattern, fn in callbacks:
+            app.add_handler(CallbackQueryHandler(fn, pattern=pattern))
 
-    logger.info(f"🚀 VIP Bot iniciado | Canal: {CHANNEL_ID} | Admin: {ADMIN_ID}")
-    app.run_polling(drop_pending_updates=True)
+        # ── Auto-respuesta ──
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_reply))
+
+        # ── Jobs ──
+        jq: JobQueue = app.job_queue
+        jq.run_repeating(job_clean_expired, interval=3600,  first=60)
+        jq.run_repeating(job_warn_expiring, interval=43200, first=120)
+        jq.run_daily(job_daily_summary, time=datetime.strptime("08:00", "%H:%M").time())
+
+        logger.info(f"🚀 VIP Bot iniciado | Canal: {CHANNEL_ID} | Admin: {ADMIN_ID}")
+
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+
+        # Mantener vivo
+        import signal
+        stop_event = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop_event.set)
+        await stop_event.wait()
+
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":
