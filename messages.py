@@ -1,12 +1,10 @@
 """
-messages.py — DX VIP Bot · Textos con diseño premium
+messages.py — VIP Bot · Textos premium
 """
 
 from datetime import datetime, timezone
-from typing import Optional
 
-
-SEP = "━━━━━━━━━━━━━━━━━━━━━━━━"
+SEP   = "━━━━━━━━━━━━━━━━━━━━━━━━"
 SEP_S = "──────────────────────"
 
 
@@ -27,38 +25,8 @@ def already_banned() -> str:
     return (
         f"🚫 *Acceso denegado*\n"
         f"{SEP}\n\n"
-        f"Tu cuenta ha sido suspendida permanentemente.\n"
+        f"Tu cuenta ha sido suspendida.\n"
         f"Contacta a soporte si crees que es un error."
-    )
-
-# ── Membresía ──
-def membership_card(first_name: str, expiry_str: str, days_left: int,
-                    total_days: int, renewals: int, joined_at: str) -> str:
-    pct = max(0, min(100, int((days_left / max(1, total_days)) * 100)))
-    filled = int(pct / 5)
-    bar_color = "🟢" if days_left > 3 else ("🟡" if days_left > 1 else "🔴")
-    bar = bar_color * filled + "⬜" * (20 - filled)
-
-    if days_left > 3:
-        status = "🟢 Activa"
-    elif days_left > 1:
-        status = "🟡 Pronto vence"
-    else:
-        status = "🔴 Crítica"
-
-    return (
-        f"💎 *Tarjeta de Membresía VIP*\n"
-        f"{SEP}\n\n"
-        f"👤 *{first_name}*\n"
-        f"Estado: {status}\n\n"
-        f"`{bar}` {pct}%\n\n"
-        f"📅 Vence: `{expiry_str}`\n"
-        f"⏳ Días restantes: *{days_left}*\n"
-        f"📊 Plan: {total_days} días totales\n"
-        f"🔄 Renovaciones: {renewals}\n"
-        f"📆 Miembro desde: `{joined_at}`\n\n"
-        f"{SEP_S}\n"
-        f"_Toca el botón para tu tarjeta visual interactiva_ 👇"
     )
 
 def no_membership() -> str:
@@ -67,7 +35,7 @@ def no_membership() -> str:
         f"{SEP}\n\n"
         f"No tienes un acceso VIP activo.\n\n"
         f"🔑 Activa un código VIP\n"
-        f"🎁 O prueba 2 días gratis"
+        f"🎁 O prueba *30 días gratis*"
     )
 
 def activation_success(first_name: str, days: int, expiry: str) -> str:
@@ -91,9 +59,9 @@ def free_trial_success(expiry: str) -> str:
     return (
         f"🎁 *¡Prueba gratuita activada!*\n"
         f"{SEP}\n\n"
-        f"Disfruta *2 días* de acceso VIP.\n"
+        f"Disfruta *30 días* de acceso VIP.\n"
         f"📅 Vence: `{expiry}`\n\n"
-        f"_Recuerda que la prueba es por única vez._"
+        f"_La prueba gratuita es por única vez._"
     )
 
 def free_trial_already_used() -> str:
@@ -108,13 +76,13 @@ def code_not_found() -> str:
     return (
         f"❌ *Código inválido*\n"
         f"{SEP}\n\n"
-        f"El código no existe, ya fue usado\n"
-        f"o fue desactivado. Verifica e intenta de nuevo."
+        f"El código no existe, ya fue usado,\n"
+        f"fue desactivado o expiró. Verifica e intenta de nuevo."
     )
 
 def expiry_warning(days_left: int) -> str:
     if days_left <= 1:
-        icon, msg = "🔴", f"¡Tu acceso VIP vence en menos de *24 horas*!"
+        icon, msg = "🔴", "¡Tu acceso VIP vence en menos de *24 horas*!"
     else:
         icon, msg = "🟡", f"Tu acceso VIP vence en *{days_left} días*."
     return (
@@ -139,7 +107,7 @@ def history_item(event: str, data: str, date: str) -> str:
     icons = {
         "activate": "🔑", "renew": "🔄", "trial": "🎁",
         "expired": "⏰",  "kicked": "🚪", "banned": "🚫",
-        "ticket": "🎟️",  "ruleta": "🎰"
+        "ticket": "🎟️",
     }
     icon = icons.get(event.split("_")[0], "•")
     return f"{icon} `{date}` — {event}\n   _{data}_\n"
@@ -160,7 +128,7 @@ def support_menu_text() -> str:
 
 def ticket_ask_subject() -> str:
     return (
-        f"✏️ *Nuevo ticket de soporte*\n"
+        f"✏️ *Nuevo ticket*\n"
         f"{SEP}\n\n"
         f"Escribe el *asunto* de tu consulta\n"
         f"_(máx. 100 caracteres)_:"
@@ -185,25 +153,20 @@ def ticket_list_header() -> str:
     return f"📋 *Mis tickets*\n{SEP}\n\n"
 
 def ticket_item(ticket_id: int, subject: str, status: str, date: str) -> str:
-    st_icon = "📬" if status == "open" else "✅"
+    st_icon  = "📬" if status == "open" else "✅"
     st_label = "Abierto" if status == "open" else "Cerrado"
-    return (
-        f"{st_icon} *#{ticket_id:04d}* — _{subject}_\n"
-        f"   {st_label} · `{date}`\n\n"
-    )
+    return f"{st_icon} *#{ticket_id:04d}* — _{subject}_\n   {st_label} · `{date}`\n\n"
 
 def ticket_detail(ticket_id: int, subject: str, status: str, messages: list) -> str:
     st_icon = "📬" if status == "open" else "✅"
-    st_label = "Abierto" if status == "open" else "Cerrado"
     txt = (
-        f"🎟️ *Ticket #{ticket_id:04d}*\n"
+        f"🎟️ *Ticket #{ticket_id:04d}* {st_icon}\n"
         f"{SEP}\n\n"
-        f"📌 _{subject}_\n"
-        f"Estado: {st_icon} {st_label}\n\n"
+        f"📌 _{subject}_\n\n"
         f"{SEP_S}\n\n"
     )
     for msg in messages:
-        who = "🛡️ *Admin*" if msg["is_admin"] else "👤 *Tú*"
+        who = "🛡️ *Soporte*" if msg["is_admin"] else "👤 *Tú*"
         txt += f"{who} · `{msg['sent_at'][:16]}`\n{msg['message']}\n\n"
     return txt
 
@@ -227,62 +190,6 @@ def ticket_new_reply_user(ticket_id: int, admin_msg: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
-# RULETA
-# ══════════════════════════════════════════════════════════════
-
-def ruleta_menu(can_play: bool, next_play: str = "") -> str:
-    if can_play:
-        return (
-            f"🎰 *Ruleta Semanal VIP*\n"
-            f"{SEP}\n\n"
-            f"¡Gira la ruleta y gana días extra!\n\n"
-            f"🎁 Premios posibles: 1 · 2 · 3 · 5 · 7 días\n"
-            f"🗓️ Disponible: *una vez por semana*\n\n"
-            f"¿Listo para girar?"
-        )
-    else:
-        return (
-            f"🎰 *Ruleta Semanal VIP*\n"
-            f"{SEP}\n\n"
-            f"⏳ Ya participaste esta semana.\n\n"
-            f"📅 Próxima tirada: *{next_play}*\n\n"
-            f"_¡Vuelve pronto para ganar más días!_"
-        )
-
-def ruleta_spinning() -> str:
-    return (
-        f"🎰 *Girando la ruleta...*\n"
-        f"{SEP}\n\n"
-        f"╔══════════════╗\n"
-        f"║  🎲 · 💎 · 🎯  ║\n"
-        f"║  🔮 · ⭐ · 🎁  ║\n"
-        f"║  🌟 · 🎰 · 🏆  ║\n"
-        f"╚══════════════╝\n\n"
-        f"_Determinando tu premio..._"
-    )
-
-RULETA_PRIZES = {1: "🥉", 2: "🥈", 3: "🥇", 5: "💎", 7: "👑"}
-
-def ruleta_result(days_won: int, new_expiry: str) -> str:
-    icon = RULETA_PRIZES.get(days_won, "🎁")
-    return (
-        f"🎉 *¡GANASTE {days_won} DÍAS!*\n"
-        f"{SEP}\n\n"
-        f"{icon} Premio: *+{days_won} días VIP*\n\n"
-        f"📅 Nuevo vencimiento: `{new_expiry}`\n\n"
-        f"_Regresa en 7 días para volver a girar._"
-    )
-
-def ruleta_no_membership() -> str:
-    return (
-        f"🎰 *Ruleta Semanal VIP*\n"
-        f"{SEP}\n\n"
-        f"⚠️ Necesitas una membresía activa\n"
-        f"para participar en la ruleta."
-    )
-
-
-# ══════════════════════════════════════════════════════════════
 # ADMIN
 # ══════════════════════════════════════════════════════════════
 
@@ -292,17 +199,19 @@ def admin_panel_text(stats: dict) -> str:
         f"{SEP}\n\n"
         f"👥 Miembros activos: *{stats['active']}*\n"
         f"📊 Total histórico: *{stats['total']}*\n"
+        f"🔴 Vencen en ≤3 días: *{stats['expiring_3d']}*\n"
         f"🔑 Códigos activos: *{stats['codes']}*\n"
         f"🎁 Pruebas usadas: *{stats['trials']}*\n"
         f"🚫 Baneados: *{stats['banned']}*\n"
         f"🎟️ Tickets abiertos: *{stats['tickets_open']}*\n"
+        f"👑 Admins: *{stats['admins']}*\n"
         f"📆 Nuevos hoy: *{stats['new_today']}*\n\n"
         f"{SEP_S}\n"
         f"Selecciona una acción:"
     )
 
-def admin_code_created(code: str, days: int, uses: int, note: str) -> str:
-    return (
+def admin_code_created(code: str, days: int, uses: int, note: str, expires_at: str = None) -> str:
+    txt = (
         f"✅ *Código generado*\n"
         f"{SEP}\n\n"
         f"🔑 Código: `{code}`\n"
@@ -310,17 +219,18 @@ def admin_code_created(code: str, days: int, uses: int, note: str) -> str:
         f"🔁 Usos: *{uses}*\n"
         f"📝 Nota: _{note or 'Sin nota'}_"
     )
+    if expires_at:
+        txt += f"\n⏰ Expira: `{expires_at}`"
+    return txt
 
 def admin_codes_list(codes: list) -> str:
     if not codes:
         return f"📋 *Sin códigos*\n{SEP}\n\nNo hay códigos registrados."
-    txt = f"📋 *Códigos VIP*\n{SEP}\n\n"
+    txt = f"📋 *Códigos VIP* ({len(codes)})\n{SEP}\n\n"
     for c in codes[:20]:
         active = "🟢" if c["is_active"] else "🔴"
-        txt += (
-            f"{active} `{c['code']}` — {c['days']}d · "
-            f"{c['used_count']}/{c['max_uses']} usos\n"
-        )
+        exp    = f" · exp:{c['expires_at'][:10]}" if c["expires_at"] else ""
+        txt += f"{active} `{c['code']}` — {c['days']}d · {c['used_count']}/{c['max_uses']}{exp}\n"
     return txt
 
 def admin_members_list(members: list) -> str:
@@ -328,45 +238,34 @@ def admin_members_list(members: list) -> str:
         return f"👥 *Sin miembros activos*\n{SEP}"
     txt = f"👥 *Miembros activos ({len(members)})*\n{SEP}\n\n"
     for m in members:
-        from datetime import timedelta
-        expiry = datetime.strptime(m["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        expiry    = datetime.strptime(m["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         days_left = max(0, (expiry - datetime.now(timezone.utc)).days)
-        if days_left > 3:
-            dot = "🟢"
-        elif days_left > 1:
-            dot = "🟡"
-        else:
-            dot = "🔴"
+        dot  = "🟢" if days_left > 3 else ("🟡" if days_left > 1 else "🔴")
         name = m["first_name"] or "Sin nombre"
-        un = f"@{m['username']}" if m["username"] else f"ID:{m['user_id']}"
+        un   = f"@{m['username']}" if m["username"] else f"ID:{m['user_id']}"
         txt += f"{dot} *{name}* {un} — {days_left}d\n"
     return txt
 
 def admin_stats(stats: dict, members: list) -> str:
-    active = stats["active"]
-    total  = stats["total"]
-    pct    = int((active / max(1, total)) * 100)
-
-    bar_len = 20
-    filled  = int((pct / 100) * bar_len)
-    bar     = "█" * filled + "░" * (bar_len - filled)
-
-    # Distribución por días restantes
-    soon     = sum(1 for m in members if 0 < (datetime.strptime(m["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days <= 3)
-    critical = sum(1 for m in members if 0 < (datetime.strptime(m["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days <= 1)
-
+    active  = stats["active"]
+    total   = stats["total"]
+    pct     = int((active / max(1, total)) * 100)
+    filled  = int((pct / 100) * 20)
+    bar     = "█" * filled + "░" * (20 - filled)
+    soon    = sum(1 for m in members if 0 < (datetime.strptime(m["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days <= 3)
+    critical= sum(1 for m in members if 0 < (datetime.strptime(m["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc) - datetime.now(timezone.utc)).days <= 1)
     return (
-        f"📊 *Estadísticas DX VIP*\n"
+        f"📊 *Estadísticas VIP*\n"
         f"{SEP}\n\n"
         f"👥 Activos / Total: *{active} / {total}*\n"
         f"`{bar}` {pct}%\n\n"
-        f"🔴 Críticos (≤1d):   *{critical}*\n"
-        f"🟡 Pronto vencen:    *{soon}*\n"
-        f"🟢 Saludables:       *{active - soon}*\n\n"
-        f"🎁 Pruebas gratis:   *{stats['trials']}*\n"
-        f"🚫 Baneados:         *{stats['banned']}*\n"
+        f"🔴 Críticos (≤1d):  *{critical}*\n"
+        f"🟡 Pronto vencen:   *{soon}*\n"
+        f"🟢 Saludables:      *{active - soon}*\n\n"
+        f"🎁 Pruebas gratis:  *{stats['trials']}*\n"
+        f"🚫 Baneados:        *{stats['banned']}*\n"
         f"🎟️ Tickets abiertos: *{stats['tickets_open']}*\n"
-        f"📆 Nuevos hoy:       *{stats['new_today']}*"
+        f"📆 Nuevos hoy:      *{stats['new_today']}*"
     )
 
 def admin_adddays_success(user_id: int, days: int, new_expiry: str) -> str:
@@ -376,14 +275,6 @@ def admin_adddays_success(user_id: int, days: int, new_expiry: str) -> str:
         f"Usuario: `{user_id}`\n"
         f"Días añadidos: *+{days}*\n"
         f"Nuevo vencimiento: `{new_expiry}`"
-    )
-
-def admin_kick_confirm(user_id: int, name: str) -> str:
-    return (
-        f"⚠️ *Confirmar expulsión*\n"
-        f"{SEP}\n\n"
-        f"Vas a expulsar a *{name}* (`{user_id}`)\n"
-        f"del canal VIP. ¿Confirmar?"
     )
 
 def admin_ban_success(user_id: int) -> str:
@@ -400,39 +291,35 @@ def admin_blacklist_list(bl: list) -> str:
         txt += f"• `{b['user_id']}` — _{b['reason'] or 'Sin razón'}_\n"
     return txt
 
-def admin_broadcast_preview(message: str) -> str:
+def admin_broadcast_preview(message: str, filter_label: str) -> str:
     return (
         f"📢 *Preview del broadcast*\n"
         f"{SEP}\n\n"
+        f"🎯 Segmento: *{filter_label}*\n\n"
         f"{message}\n\n"
         f"{SEP_S}\n"
-        f"¿Enviar a todos los miembros activos?"
+        f"¿Enviar a este segmento?"
     )
 
-def admin_broadcast_done(sent: int, failed: int) -> str:
+def admin_broadcast_done(sent: int, failed: int, filter_label: str) -> str:
     return (
         f"✅ *Broadcast completado*\n"
         f"{SEP}\n\n"
+        f"🎯 Segmento: *{filter_label}*\n"
         f"✉️ Enviados: *{sent}*\n"
         f"❌ Fallidos: *{failed}*"
     )
 
-
-# ── Admin Tickets ──
 def admin_tickets_list(tickets: list, open_only: bool = False) -> str:
     if not tickets:
         label = "abiertos" if open_only else "registrados"
         return f"🎟️ *Sin tickets {label}*\n{SEP}"
     title = "Tickets abiertos" if open_only else "Todos los tickets"
-    txt = f"🎟️ *{title} ({len(tickets)})*\n{SEP}\n\n"
+    txt   = f"🎟️ *{title} ({len(tickets)})*\n{SEP}\n\n"
     for t in tickets:
-        st = "📬" if t["status"] == "open" else "✅"
+        st   = "📬" if t["status"] == "open" else "✅"
         name = t["first_name"] or "Sin nombre"
-        txt += (
-            f"{st} *#{t['id']:04d}* · {name}\n"
-            f"   📌 _{t['subject']}_\n"
-            f"   `{t['updated_at'][:16]}`\n\n"
-        )
+        txt += f"{st} *#{t['id']:04d}* · {name}\n   📌 _{t['subject']}_\n   `{t['updated_at'][:16]}`\n\n"
     return txt
 
 def admin_ticket_detail(ticket, messages: list) -> str:
@@ -446,35 +333,50 @@ def admin_ticket_detail(ticket, messages: list) -> str:
         f"{SEP_S}\n\n"
     )
     for msg in messages:
-        who = "🛡️ *Admin*" if msg["is_admin"] else f"👤 *Usuario*"
+        who = "🛡️ *Admin*" if msg["is_admin"] else "👤 *Usuario*"
         txt += f"{who} · `{msg['sent_at'][:16]}`\n{msg['message']}\n\n"
     return txt
 
 def admin_ticket_reply_sent(ticket_id: int) -> str:
     return f"✅ Respuesta enviada al ticket *#{ticket_id:04d}*."
 
-
-# ── Admin Ranking ──
 def admin_ranking(members: list) -> str:
     if not members:
         return f"🏆 *Ranking VIP*\n{SEP}\n\nSin datos todavía."
     medals = ["🥇", "🥈", "🥉"] + ["🏅"] * 20
-    txt = f"🏆 *Ranking VIP · Top {len(members)}*\n{SEP}\n\n"
+    txt    = f"🏆 *Ranking VIP · Top {len(members)}*\n{SEP}\n\n"
     for i, m in enumerate(members):
         name = m["first_name"] or "Sin nombre"
-        un = f"@{m['username']}" if m["username"] else f"ID:{m['user_id']}"
+        un   = f"@{m['username']}" if m["username"] else f"ID:{m['user_id']}"
         txt += f"{medals[i]} *{name}* {un}\n   📊 {m['total_days']} días acumulados\n\n"
     return txt
 
+def admin_admins_list(admins: list, main_admin_id: int) -> str:
+    txt = f"👑 *Administradores*\n{SEP}\n\n"
+    txt += f"⭐ *Admin principal* · `{main_admin_id}`\n\n"
+    if not admins:
+        txt += "_Sin admins secundarios._"
+    else:
+        for a in admins:
+            name = a["first_name"] or "Sin nombre"
+            un   = f"@{a['username']}" if a["username"] else f"ID:{a['user_id']}"
+            txt += f"👑 *{name}* {un}\n   Añadido: `{a['added_at'][:10]}`\n\n"
+    return txt
 
-# ── Daily summary ──
+def admin_add_admin_success(user_id: int) -> str:
+    return f"✅ Admin `{user_id}` añadido correctamente."
+
+def admin_remove_admin_success(user_id: int) -> str:
+    return f"✅ Admin `{user_id}` removido correctamente."
+
 def daily_summary(stats: dict) -> str:
     return (
-        f"☀️ *Resumen diario · DX VIP*\n"
+        f"☀️ *Resumen diario · VIP Bot*\n"
         f"{SEP}\n\n"
         f"👥 Miembros activos: *{stats['active']}*\n"
+        f"🔴 Vencen en ≤3 días: *{stats['expiring_3d']}*\n"
         f"📆 Nuevos hoy: *{stats['new_today']}*\n"
         f"🎟️ Tickets abiertos: *{stats['tickets_open']}*\n"
         f"🚫 Baneados: *{stats['banned']}*\n\n"
-        f"_DX VIP Bot · {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC_"
+        f"_VIP Bot · {datetime.now(timezone.utc).strftime('%d/%m/%Y %H:%M')} UTC_"
     )
