@@ -1,10 +1,11 @@
 """
 bot.py — VIP Bot · Versión mejorada
 Mejoras añadidas:
-  ✅ /api/news    — Endpoint con caché de noticias ForexLive (10 min)
-  ✅ /api/calendar — Endpoint con calendario económico de la semana
-  ✅ job_news_alerts    — Alertas de eventos de ALTO impacto 30 min antes
-  ✅ job_warn_expiring  — Mejorado: avisa a 72h, 24h y 1h antes del vencimiento
+  ✅ /api/news         — Endpoint con caché de noticias crypto (10 min)
+  ✅ /api/calendar     — Endpoint con calendario económico de la semana
+  ✅ job_calendar_alerts — Alertas de eventos de ALTO impacto 30 min antes
+  ✅ job_warn_expiring   — Mejorado: avisa a 72h, 24h y 1h antes del vencimiento
+  ✅ job_crypto_news     — Noticias crypto/forex al canal cada 30 min (RSS directo)
   ✅ CORS mejorado para Mini App
 """
 
@@ -18,8 +19,10 @@ import random
 import secrets
 import string
 import asyncio
+import xml.etree.ElementTree as ET
 import aiohttp
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, unquote
 
 from aiohttp import web
@@ -57,10 +60,25 @@ API_PORT        = int(os.getenv("PORT", os.getenv("API_PORT", "8080")))
 # ──────────────────────────────────────────────────────────────
 _news_cache: dict = {"items": [], "fetched_at": None}
 _calendar_cache: dict = {"events": [], "fetched_at": None}
-_alerted_events: set = set()   # IDs de eventos ya alertados para no repetir
+_alerted_events: set = set()    # IDs de eventos económicos ya alertados
+_seen_news_links: set = set()   # Links de noticias ya publicadas en canal
 
-NEWS_CACHE_SECONDS     = 600   # 10 minutos
-CALENDAR_CACHE_SECONDS = 1800  # 30 minutos
+NEWS_CACHE_SECONDS     = 600    # 10 minutos
+CALENDAR_CACHE_SECONDS = 1800   # 30 minutos
+
+# ──────────────────────────────────────────────────────────────
+# FUENTES RSS CRYPTO/FOREX — sin depender de rss2json.com
+# Formato: (nombre_display, url_rss, idioma)
+# ──────────────────────────────────────────────────────────────
+RSS_SOURCES = [
+    ("🇪🇸 Cointelegraph ES",  "https://es.cointelegraph.com/rss",                    "es"),
+    ("🇪🇸 BeInCrypto ES",     "https://es.beincrypto.com/feed/",                     "es"),
+    ("🇪🇸 CriptoNoticias",    "https://www.criptonoticias.com/feed/",                 "es"),
+    ("🇺🇸 Cointelegraph EN",  "https://cointelegraph.com/rss",                       "en"),
+    ("🇺🇸 CoinDesk",          "https://www.coindesk.com/arc/outboundfeeds/rss/",     "en"),
+    ("🇺🇸 Decrypt",           "https://decrypt.co/feed",                             "en"),
+    ("🇺🇸 ForexLive",         "https://www.forexlive.com/feed/news",                 "en"),
+]
 
 # ──────────────────────────────────────────────────────────────
 # CORS HEADERS
@@ -150,66 +168,112 @@ async def api_user_info(request: web.Request) -> web.Response:
 
 
 # ──────────────────────────────────────────────────────────────
-# API ENDPOINT — /api/news  ← NUEVO
-# Devuelve noticias de ForexLive con caché de 10 minutos
+# HELPER — Parser RSS directo (sin rss2json.com)
+# ──────────────────────────────────────────────────────────────
+async def fetch_rss_items(session: aiohttp.ClientSession, name: str, url: str, max_items: int = 5) -> list[dict]:
+    """
+    Descarga y parsea un feed RSS/Atom directamente.
+    Retorna lista de dicts con title, link, pubDate, source.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; VIPBot/2.0; +https://t.me/bot)",
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                logger.warning(f"RSS {name}: HTTP {resp.status}")
+                return []
+            raw = await resp.read()
+
+        root = ET.fromstring(raw)
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+
+        items = []
+
+        # RSS 2.0
+        for item in root.findall(".//item")[:max_items]:
+            title = item.findtext("title", "").strip()
+            link  = item.findtext("link", "").strip()
+            date  = item.findtext("pubDate", "").strip()
+            if title and link:
+                items.append({"title": title, "link": link, "pubDate": date, "source": name})
+
+        # Atom (si no encontró items RSS)
+        if not items:
+            for entry in root.findall(".//atom:entry", ns)[:max_items]:
+                title = entry.findtext("atom:title", "", ns).strip()
+                link_el = entry.find("atom:link", ns)
+                link  = link_el.get("href", "") if link_el is not None else ""
+                date  = entry.findtext("atom:updated", "", ns).strip()
+                if title and link:
+                    items.append({"title": title, "link": link, "pubDate": date, "source": name})
+
+        logger.info(f"RSS {name}: {len(items)} items")
+        return items
+
+    except ET.ParseError as e:
+        logger.warning(f"RSS {name}: XML parse error — {e}")
+        return []
+    except asyncio.TimeoutError:
+        logger.warning(f"RSS {name}: timeout")
+        return []
+    except Exception as e:
+        logger.warning(f"RSS {name}: {e}")
+        return []
+
+
+async def refresh_news_cache() -> list[dict]:
+    """
+    Recorre RSS_SOURCES en paralelo y actualiza _news_cache.
+    Devuelve la lista de items actualizada (o la caché vieja si todo falla).
+    """
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    # Si la caché aún es válida, devolverla directamente
+    if _news_cache["fetched_at"] and (now_ts - _news_cache["fetched_at"]) < NEWS_CACHE_SECONDS:
+        return _news_cache["items"]
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_rss_items(session, name, url) for name, url, _ in RSS_SOURCES]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_items: list[dict] = []
+    for res in results:
+        if isinstance(res, list):
+            all_items.extend(res)
+
+    if all_items:
+        _news_cache["items"]      = all_items
+        _news_cache["fetched_at"] = now_ts
+        logger.info(f"refresh_news_cache: {len(all_items)} noticias totales cargadas")
+    else:
+        logger.warning("refresh_news_cache: todos los feeds fallaron — usando caché anterior")
+
+    return _news_cache["items"]
+
+
+# ──────────────────────────────────────────────────────────────
+# API ENDPOINT — /api/news
+# Devuelve noticias crypto/forex con caché de 10 minutos
 # ──────────────────────────────────────────────────────────────
 async def api_news(request: web.Request) -> web.Response:
     if request.method == "OPTIONS":
         return web.Response(status=204, headers=CORS)
 
-    now = datetime.now(timezone.utc).timestamp()
-    cached = _news_cache
+    items = await refresh_news_cache()
+    now   = datetime.now(timezone.utc).timestamp()
 
-    # Devolver caché si es reciente
-    if cached["fetched_at"] and (now - cached["fetched_at"]) < NEWS_CACHE_SECONDS:
-        return web.json_response({
-            "items":      cached["items"],
-            "cached":     True,
-            "fetched_at": cached["fetched_at"],
-            "age_seconds": int(now - cached["fetched_at"]),
-        }, headers=CORS)
-
-    # Fetch fresco desde RSS
-    try:
-        rss_url = "https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fwww.forexlive.com%2Ffeed%2Fnews&count=15"
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            async with session.get(rss_url) as resp:
-                data = await resp.json(content_type=None)
-
-        if data.get("status") != "ok" or not data.get("items"):
-            raise ValueError("RSS sin datos")
-
-        items = [
-            {
-                "title":   item.get("title", ""),
-                "link":    item.get("link", ""),
-                "pubDate": item.get("pubDate", ""),
-                "source":  "ForexLive",
-            }
-            for item in data["items"][:15]
-        ]
-
-        _news_cache["items"]      = items
-        _news_cache["fetched_at"] = now
-        logger.info(f"api_news: actualizadas {len(items)} noticias")
-
-        return web.json_response({
-            "items":      items,
-            "cached":     False,
-            "fetched_at": now,
-            "age_seconds": 0,
-        }, headers=CORS)
-
-    except Exception as e:
-        logger.warning(f"api_news fetch error: {e}")
-        # Si falla, devolver caché vieja si existe
-        if cached["items"]:
-            return web.json_response({
-                "items":   cached["items"],
-                "cached":  True,
-                "error":   "fetch_failed_using_cache",
-            }, headers=CORS)
+    if not items:
         return web.json_response({"error": "no_data", "items": []}, status=503, headers=CORS)
+
+    return web.json_response({
+        "items":       items[:20],
+        "cached":      True,
+        "fetched_at":  _news_cache["fetched_at"],
+        "age_seconds": int(now - (_news_cache["fetched_at"] or now)),
+        "total":       len(items),
+    }, headers=CORS)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1281,71 +1345,82 @@ async def job_daily_summary(context: ContextTypes.DEFAULT_TYPE):
 
 async def job_crypto_news(context: ContextTypes.DEFAULT_TYPE):
     """
-    Cada 30 minutos: publica las últimas noticias crypto/forex
-    en el canal VIP. Evita repetir noticias ya publicadas.
+    Cada 30 minutos: descarga noticias crypto/forex desde RSS directo
+    y publica las nuevas en el canal VIP. No repite links ya publicados.
+    Usa fallback entre fuentes: si una falla, intenta la siguiente.
     """
+    logger.info("job_crypto_news: iniciando ciclo de noticias")
+
+    # Refrescar caché forzando nueva descarga si hace más de 25 min
     now_ts = datetime.now(timezone.utc).timestamp()
+    if _news_cache["fetched_at"] and (now_ts - _news_cache["fetched_at"]) < 1500:
+        items = _news_cache["items"]
+        logger.info(f"job_crypto_news: usando caché ({len(items)} items)")
+    else:
+        items = await refresh_news_cache()
 
-    # Refrescar caché si es necesario
-    if not _news_cache["fetched_at"] or (now_ts - _news_cache["fetched_at"]) > NEWS_CACHE_SECONDS:
-        try:
-            feeds = [
-                "https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fes.cointelegraph.com%2Frss&count=5",
-                "https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fcointelegraph.com%2Frss&count=5",
-                "https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fcryptonoticias.com%2Ffeed%2F&count=5",
-            ]
-            items = []
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                for url in feeds:
-                    try:
-                        async with session.get(url) as resp:
-                            data = await resp.json(content_type=None)
-                        if data.get("status") == "ok":
-                            for item in data.get("items", []):
-                                items.append({
-                                    "title":   item.get("title", ""),
-                                    "link":    item.get("link", ""),
-                                    "pubDate": item.get("pubDate", ""),
-                                    "source":  data.get("feed", {}).get("title", "Crypto News"),
-                                })
-                    except Exception as e:
-                        logger.warning(f"job_crypto_news feed error: {e}")
-                        continue
+    if not items:
+        logger.warning("job_crypto_news: sin noticias disponibles en ninguna fuente")
+        return
 
-            _news_cache["items"]      = items
-            _news_cache["fetched_at"] = now_ts
-            logger.info(f"job_crypto_news: {len(items)} noticias cargadas")
-        except Exception as e:
-            logger.warning(f"job_crypto_news fetch error: {e}")
-            return
+    # Filtrar solo las noticias nuevas (link no publicado antes)
+    new_items = [it for it in items if it.get("link") and it["link"] not in _seen_news_links]
 
-    # Publicar solo noticias nuevas (link no visto antes)
-    published = 0
-    for item in _news_cache.get("items", [])[:10]:
-        link = item.get("link", "")
-        if not link or link in _alerted_events:
+    if not new_items:
+        logger.info("job_crypto_news: sin noticias nuevas para publicar")
+        return
+
+    # Limitar a máximo 5 noticias por ciclo para no spamear el canal
+    to_publish = new_items[:5]
+    published  = 0
+
+    for item in to_publish:
+        title  = item.get("title", "").strip()
+        link   = item.get("link", "").strip()
+        source = item.get("source", "Crypto News")
+        date   = item.get("pubDate", "")
+
+        if not title or not link:
             continue
 
-        _alerted_events.add(link)
+        # Formatear fecha si existe
+        date_str = ""
+        if date:
+            try:
+                dt = parsedate_to_datetime(date)
+                date_str = f"\n🕐 {dt.strftime('%d/%m/%Y %H:%M')} UTC"
+            except Exception:
+                pass
+
         text = (
-            f"📰 *{item['title']}*\n"
+            f"📰 *{title}*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔗 {link}\n"
-            f"📡 _{item['source']}_"
+            f"📡 {source}{date_str}\n\n"
+            f"🔗 {link}"
         )
+
         try:
             await context.bot.send_message(
-                CHANNEL_ID, text,
+                CHANNEL_ID,
+                text,
                 parse_mode=ParseMode.MARKDOWN,
-                disable_web_page_preview=False
+                disable_web_page_preview=False,
             )
+            _seen_news_links.add(link)
             published += 1
-            await asyncio.sleep(2)  # evitar flood de mensajes
-        except TelegramError as e:
-            logger.warning(f"job_crypto_news send error: {e}")
+            await asyncio.sleep(3)  # pausa entre mensajes para evitar flood
 
-    if published:
-        logger.info(f"job_crypto_news: {published} noticias publicadas en canal {CHANNEL_ID}")
+        except TelegramError as e:
+            logger.warning(f"job_crypto_news: error enviando '{title[:40]}': {e}")
+
+    # Limpiar links vistos muy viejos para no crecer infinitamente (mantener últimos 500)
+    if len(_seen_news_links) > 500:
+        # Convertir a lista y conservar los últimos 300
+        links_list = list(_seen_news_links)
+        _seen_news_links.clear()
+        _seen_news_links.update(links_list[-300:])
+
+    logger.info(f"job_crypto_news: {published}/{len(to_publish)} noticias publicadas en canal {CHANNEL_ID}")
 
 
 # ──────────────────────────────────────────────────────────────
