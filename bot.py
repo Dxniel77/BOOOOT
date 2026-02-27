@@ -5,6 +5,7 @@ Flujo AMIGABLE:
   ✅ Usuario pega código → verifica → agrega al canal automáticamente
   ✅ Jobs automáticos: expulsar vencidos cada hora
   ✅ API endpoints para Mini App
+  ✅ TODAS las funciones incluidas y corregidas
 """
 
 import hashlib
@@ -371,6 +372,23 @@ async def check_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
                 pass
         return True
     return False
+
+# ──────────────────────────────────────────────────────────────
+# MENÚ PRINCIPAL - CALLBACK (CORREGIDO)
+# ──────────────────────────────────────────────────────────────
+async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Regresa al menú principal"""
+    if await check_banned(update, context):
+        return
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    await q.edit_message_text(
+        f"✨ *Hola {user.first_name}*\n\n"
+        f"Selecciona una opción del menú:",
+        reply_markup=kb.main_menu(),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 # ──────────────────────────────────────────────────────────────
 # HANDLER PRINCIPAL - START (VERSIÓN AMIGABLE CON NOMBRE)
