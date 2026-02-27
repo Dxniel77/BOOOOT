@@ -16,8 +16,10 @@ def welcome(first_name: str) -> str:
     return (
         f"💎 *Bienvenido, {first_name}*\n"
         f"{SEP}\n\n"
-        f"Accede al canal VIP exclusivo activando\n"
-        f"tu código o renovando tu membresía.\n\n"
+        f"Accede al canal VIP exclusivo de *Copy Trading*\n"
+        f"activando tu código o renovando tu membresía.\n\n"
+        f"📲 Usa *Mi membresía VIP* para ver tu tarjeta\n"
+        f"con el tiempo restante y la calculadora de lotaje.\n\n"
         f"Selecciona una opción:"
     )
 
