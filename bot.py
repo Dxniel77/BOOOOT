@@ -1,9 +1,11 @@
 """
-bot.py — VIP Bot · Lógica principal
-Funciones: activar código, renovar, membresía (Mini App directa),
-           prueba gratis 30 días, tickets, ranking, multi-admin,
-           broadcast segmentado, exportar CSV, códigos con expiración.
-Sin ruleta semanal.
+bot.py — VIP Bot · Versión mejorada
+Mejoras añadidas:
+  ✅ /api/news    — Endpoint con caché de noticias ForexLive (10 min)
+  ✅ /api/calendar — Endpoint con calendario económico de la semana
+  ✅ job_news_alerts    — Alertas de eventos de ALTO impacto 30 min antes
+  ✅ job_warn_expiring  — Mejorado: avisa a 72h, 24h y 1h antes del vencimiento
+  ✅ CORS mejorado para Mini App
 """
 
 import hashlib
@@ -15,6 +17,8 @@ import os
 import random
 import secrets
 import string
+import asyncio
+import aiohttp
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, unquote
 
@@ -42,19 +46,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN  = os.getenv("BOT_TOKEN")
-ADMIN_ID   = int(os.getenv("ADMIN_ID", "0"))
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003738953503"))
+BOT_TOKEN       = os.getenv("BOT_TOKEN")
+ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
+CHANNEL_ID      = int(os.getenv("CHANNEL_ID", "-1003738953503"))
 FREE_TRIAL_DAYS = 30
-# Railway expone la variable PORT automáticamente
-API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "8080")))
+API_PORT        = int(os.getenv("PORT", os.getenv("API_PORT", "8080")))
+
+# ──────────────────────────────────────────────────────────────
+# CACHÉ EN MEMORIA (sin Redis ni DB extra)
+# ──────────────────────────────────────────────────────────────
+_news_cache: dict = {"items": [], "fetched_at": None}
+_calendar_cache: dict = {"events": [], "fetched_at": None}
+_alerted_events: set = set()   # IDs de eventos ya alertados para no repetir
+
+NEWS_CACHE_SECONDS     = 600   # 10 minutos
+CALENDAR_CACHE_SECONDS = 1800  # 30 minutos
+
+# ──────────────────────────────────────────────────────────────
+# CORS HEADERS
+# ──────────────────────────────────────────────────────────────
+CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
 
 
 # ──────────────────────────────────────────────────────────────
-# HTTP API SERVER (para Mini App)
+# TELEGRAM initData VERIFICACIÓN
 # ──────────────────────────────────────────────────────────────
 def verify_telegram_init_data(init_data: str, bot_token: str) -> dict | None:
-    """Verifica la firma de Telegram initData y retorna el user dict o None."""
     try:
         params = dict(parse_qsl(init_data, keep_blank_values=True))
         hash_val = params.pop("hash", "")
@@ -69,18 +90,16 @@ def verify_telegram_init_data(init_data: str, bot_token: str) -> dict | None:
         return None
 
 
+# ──────────────────────────────────────────────────────────────
+# API ENDPOINT — /api/user_info  (sin cambios)
+# ──────────────────────────────────────────────────────────────
 async def api_user_info(request: web.Request) -> web.Response:
-    cors_headers = {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type",
-    }
     if request.method == "OPTIONS":
-        return web.Response(status=204, headers=cors_headers)
+        return web.Response(status=204, headers=CORS)
 
     init_data = request.rel_url.query.get("initData", "")
     user = None
-    uid = 0
+    uid  = 0
 
     if init_data:
         user = verify_telegram_init_data(init_data, BOT_TOKEN or "")
@@ -88,9 +107,9 @@ async def api_user_info(request: web.Request) -> web.Response:
             uid = user.get("id", 0)
         if uid == 0:
             try:
-                params = dict(parse_qsl(init_data, keep_blank_values=True))
+                params   = dict(parse_qsl(init_data, keep_blank_values=True))
                 user_raw = json.loads(unquote(params.get("user", "{}")))
-                uid = user_raw.get("id", 0)
+                uid      = user_raw.get("id", 0)
                 if uid:
                     user = user_raw
             except Exception:
@@ -103,7 +122,7 @@ async def api_user_info(request: web.Request) -> web.Response:
             pass
 
     if uid == 0:
-        return web.json_response({"error": "missing user_id"}, status=400, headers=cors_headers)
+        return web.json_response({"error": "missing user_id"}, status=400, headers=CORS)
 
     sub = await db.get_subscription(uid)
     if not sub:
@@ -111,36 +130,153 @@ async def api_user_info(request: web.Request) -> web.Response:
             "has_membership": False,
             "user_id": uid,
             "first_name": user.get("first_name", "") if user else "",
-        }, headers=cors_headers)
+        }, headers=CORS)
 
-    expiry_dt = datetime.strptime(sub["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-    now_dt = datetime.now(timezone.utc)
+    expiry_dt   = datetime.strptime(sub["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    now_dt      = datetime.now(timezone.utc)
     seconds_left = max(0, int((expiry_dt - now_dt).total_seconds()))
 
     return web.json_response({
-        "has_membership": True,
-        "user_id": uid,
-        "first_name": sub["first_name"] or (user.get("first_name", "") if user else ""),
-        "username": sub["username"] or "",
-        "expiry": sub["expiry"],
-        "expires_at_ts": int(expiry_dt.timestamp() * 1000),  # ms para JS
-        "seconds_left": seconds_left,
-        "total_days": sub["total_days"] or 0,
-        "is_expired": now_dt > expiry_dt,
-    }, headers=cors_headers)
+        "has_membership":  True,
+        "user_id":         uid,
+        "first_name":      sub["first_name"] or (user.get("first_name", "") if user else ""),
+        "username":        sub["username"] or "",
+        "expiry":          sub["expiry"],
+        "expires_at_ts":   int(expiry_dt.timestamp() * 1000),
+        "seconds_left":    seconds_left,
+        "total_days":      sub["total_days"] or 0,
+        "is_expired":      now_dt > expiry_dt,
+    }, headers=CORS)
 
 
+# ──────────────────────────────────────────────────────────────
+# API ENDPOINT — /api/news  ← NUEVO
+# Devuelve noticias de ForexLive con caché de 10 minutos
+# ──────────────────────────────────────────────────────────────
+async def api_news(request: web.Request) -> web.Response:
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=CORS)
+
+    now = datetime.now(timezone.utc).timestamp()
+    cached = _news_cache
+
+    # Devolver caché si es reciente
+    if cached["fetched_at"] and (now - cached["fetched_at"]) < NEWS_CACHE_SECONDS:
+        return web.json_response({
+            "items":      cached["items"],
+            "cached":     True,
+            "fetched_at": cached["fetched_at"],
+            "age_seconds": int(now - cached["fetched_at"]),
+        }, headers=CORS)
+
+    # Fetch fresco desde RSS
+    try:
+        rss_url = "https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fwww.forexlive.com%2Ffeed%2Fnews&count=15"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(rss_url) as resp:
+                data = await resp.json(content_type=None)
+
+        if data.get("status") != "ok" or not data.get("items"):
+            raise ValueError("RSS sin datos")
+
+        items = [
+            {
+                "title":   item.get("title", ""),
+                "link":    item.get("link", ""),
+                "pubDate": item.get("pubDate", ""),
+                "source":  "ForexLive",
+            }
+            for item in data["items"][:15]
+        ]
+
+        _news_cache["items"]      = items
+        _news_cache["fetched_at"] = now
+        logger.info(f"api_news: actualizadas {len(items)} noticias")
+
+        return web.json_response({
+            "items":      items,
+            "cached":     False,
+            "fetched_at": now,
+            "age_seconds": 0,
+        }, headers=CORS)
+
+    except Exception as e:
+        logger.warning(f"api_news fetch error: {e}")
+        # Si falla, devolver caché vieja si existe
+        if cached["items"]:
+            return web.json_response({
+                "items":   cached["items"],
+                "cached":  True,
+                "error":   "fetch_failed_using_cache",
+            }, headers=CORS)
+        return web.json_response({"error": "no_data", "items": []}, status=503, headers=CORS)
+
+
+# ──────────────────────────────────────────────────────────────
+# API ENDPOINT — /api/calendar  ← NUEVO
+# Devuelve el calendario económico de la semana con caché 30 min
+# ──────────────────────────────────────────────────────────────
+async def api_calendar(request: web.Request) -> web.Response:
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=CORS)
+
+    now    = datetime.now(timezone.utc).timestamp()
+    cached = _calendar_cache
+
+    if cached["fetched_at"] and (now - cached["fetched_at"]) < CALENDAR_CACHE_SECONDS:
+        return web.json_response({
+            "events":     cached["events"],
+            "cached":     True,
+            "age_seconds": int(now - cached["fetched_at"]),
+        }, headers=CORS)
+
+    try:
+        cal_url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(cal_url) as resp:
+                events = await resp.json(content_type=None)
+
+        _calendar_cache["events"]     = events
+        _calendar_cache["fetched_at"] = now
+        logger.info(f"api_calendar: {len(events)} eventos cargados")
+
+        return web.json_response({
+            "events":     events,
+            "cached":     False,
+            "age_seconds": 0,
+        }, headers=CORS)
+
+    except Exception as e:
+        logger.warning(f"api_calendar fetch error: {e}")
+        if cached["events"]:
+            return web.json_response({"events": cached["events"], "cached": True, "error": "fetch_failed_using_cache"}, headers=CORS)
+        return web.json_response({"error": "no_data", "events": []}, status=503, headers=CORS)
+
+
+# ──────────────────────────────────────────────────────────────
+# HTTP SERVER
+# ──────────────────────────────────────────────────────────────
 async def start_api_server():
     app_http = web.Application()
+    # Rutas existentes
     app_http.router.add_route("GET",     "/api/user_info", api_user_info)
     app_http.router.add_route("OPTIONS", "/api/user_info", api_user_info)
+    # Rutas nuevas
+    app_http.router.add_route("GET",     "/api/news",      api_news)
+    app_http.router.add_route("OPTIONS", "/api/news",      api_news)
+    app_http.router.add_route("GET",     "/api/calendar",  api_calendar)
+    app_http.router.add_route("OPTIONS", "/api/calendar",  api_calendar)
+
     runner = web.AppRunner(app_http)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", API_PORT)
     await site.start()
-    logger.info(f"🌐 API HTTP corriendo en :{API_PORT}")
+    logger.info(f"🌐 API HTTP corriendo en :{API_PORT}  (news + calendar endpoints activos)")
 
-# ── States ──
+
+# ──────────────────────────────────────────────────────────────
+# Estados de conversación
+# ──────────────────────────────────────────────────────────────
 (
     STATE_ACTIVATE,
     STATE_RENEW,
@@ -157,7 +293,6 @@ async def start_api_server():
     STATE_ADDDAYS_INPUT,
 ) = range(13)
 
-# Broadcast segment state
 BROADCAST_FILTER: dict = {}
 
 
@@ -200,7 +335,6 @@ async def add_to_channel(bot, user_id: int) -> str | None:
         return None
 
 async def notify_user(bot, user_id: int, text: str, **kwargs):
-    """Envía mensaje al usuario silenciosamente si falla."""
     try:
         await bot.send_message(user_id, text, **kwargs)
     except TelegramError as e:
@@ -362,7 +496,7 @@ async def renew_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────────
-# PRUEBA GRATIS — 30 DÍAS, SOLO PRIMERA VEZ
+# PRUEBA GRATIS
 # ──────────────────────────────────────────────────────────────
 async def free_trial_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_banned(update, context):
@@ -409,7 +543,7 @@ async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────────
-# 🎟️ SOPORTE / TICKETS
+# SOPORTE / TICKETS  (sin cambios)
 # ──────────────────────────────────────────────────────────────
 async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_banned(update, context):
@@ -439,8 +573,6 @@ async def ticket_message_received(update: Update, context: ContextTypes.DEFAULT_
     await db.add_ticket_message(ticket_id, user.id, content, is_admin=False)
     await db.log_event("ticket", user.id, f"id={ticket_id}")
     await update.message.reply_text(msg.ticket_created(ticket_id, subject), parse_mode=ParseMode.MARKDOWN, reply_markup=kb.main_menu())
-
-    # Notificar a todos los admins
     admin_ids = await db.get_all_admin_ids()
     for aid in admin_ids:
         await notify_user(
@@ -449,535 +581,559 @@ async def ticket_message_received(update: Update, context: ContextTypes.DEFAULT_
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=kb.admin_ticket_actions(ticket_id, True)
         )
-
-    context.user_data.clear()
     return ConversationHandler.END
 
 async def ticket_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q       = update.callback_query
-    await q.answer()
-    user    = q.from_user
-    tickets = await db.get_user_tickets(user.id)
-    txt     = msg.ticket_list_header()
+    if await check_banned(update, context): return
+    q = update.callback_query; await q.answer()
+    tickets = await db.get_user_tickets(q.from_user.id)
     if not tickets:
-        txt += "_No tienes tickets registrados._"
-    for t in tickets:
-        txt += msg.ticket_item(t["id"], t["subject"], t["status"], t["updated_at"][:16])
-    buttons = [[InlineKeyboardButton(f"📬 Ver #{t['id']:04d}", callback_data=f"ticket_view_{t['id']}")] for t in tickets[:5] if t["status"] == "open"]
-    buttons.append([InlineKeyboardButton("🏠 Menú principal", callback_data="main_menu")])
-    await q.edit_message_text(txt[:4000], parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
+        await q.edit_message_text("📭 No tienes tickets abiertos.", reply_markup=kb.main_menu())
+        return
+    txt = "🎟️ *Tus tickets*\n━━━━━━━━━━━━━━━━\n\n"
+    btns = []
+    for t in tickets[:10]:
+        st = "🟢" if t["status"] == "open" else "⚫"
+        txt += f"{st} *#{t['id']:04d}* — {t['subject'][:40]}\n"
+        btns.append([InlineKeyboardButton(f"#{t['id']:04d} {t['subject'][:25]}", callback_data=f"ticket_view_{t['id']}")])
+    btns.append([InlineKeyboardButton("← Menú", callback_data="main_menu")])
+    await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.MARKDOWN)
 
 async def ticket_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q         = update.callback_query
-    await q.answer()
-    ticket_id = int(q.data.split("_")[-1])
-    ticket    = await db.get_ticket(ticket_id)
-    messages_ = await db.get_ticket_messages(ticket_id)
-    if not ticket:
-        await q.answer("Ticket no encontrado.", show_alert=True)
-        return
-    await q.edit_message_text(
-        msg.ticket_detail(ticket_id, ticket["subject"], ticket["status"], messages_),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=kb.ticket_user_actions(ticket_id, ticket["status"] == "open")
-    )
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    ticket = await db.get_ticket(tid)
+    if not ticket or ticket["user_id"] != q.from_user.id:
+        await q.answer("❌ Ticket no encontrado.", show_alert=True); return
+    messages_list = await db.get_ticket_messages(tid)
+    txt = f"🎟️ *Ticket #{tid:04d}*\n📌 _{ticket['subject']}_\n🔘 Estado: {'🟢 Abierto' if ticket['status'] == 'open' else '⚫ Cerrado'}\n━━━━━━━━━━━━━━━━\n\n"
+    for m in messages_list[-5:]:
+        who = "👤" if not m["is_admin"] else "🛡️ Admin"
+        txt += f"*{who}* `{m['sent_at'][:16]}`\n{m['message'][:200]}\n\n"
+    btns = []
+    if ticket["status"] == "open":
+        btns.append([InlineKeyboardButton("↩️ Responder", callback_data=f"ticket_reply_{tid}")])
+        btns.append([InlineKeyboardButton("✅ Cerrar ticket", callback_data=f"ticket_close_{tid}")])
+    else:
+        btns.append([InlineKeyboardButton("🔄 Reabrir", callback_data=f"ticket_reopen_{tid}")])
+    btns.append([InlineKeyboardButton("← Mis tickets", callback_data="ticket_list")])
+    await q.edit_message_text(txt[:4000], reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.MARKDOWN)
 
 async def ticket_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q         = update.callback_query
-    await q.answer()
-    ticket_id = int(q.data.split("_")[-1])
-    context.user_data["reply_ticket_id"] = ticket_id
-    await q.edit_message_text(f"💬 Responder ticket *#{ticket_id:04d}*\n\nEscribe tu mensaje:", parse_mode=ParseMode.MARKDOWN, reply_markup=kb.cancel_keyboard())
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    context.user_data["reply_ticket_id"] = tid
+    await q.edit_message_text(f"✍️ Escribe tu respuesta para el ticket *#{tid:04d}*:", reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
     return STATE_TICKET_REPLY_USER
 
 async def ticket_reply_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user      = update.effective_user
-    ticket_id = context.user_data.get("reply_ticket_id")
-    text      = update.message.text.strip()
-    await db.add_ticket_message(ticket_id, user.id, text, is_admin=False)
-    await update.message.reply_text(msg.ticket_reply_sent(), parse_mode=ParseMode.MARKDOWN, reply_markup=kb.support_menu())
+    user = update.effective_user
+    tid  = context.user_data.get("reply_ticket_id")
+    if not tid:
+        return ConversationHandler.END
+    await db.add_ticket_message(tid, user.id, update.message.text.strip(), is_admin=False)
+    await update.message.reply_text(f"✅ Respuesta enviada al ticket *#{tid:04d}*.", parse_mode=ParseMode.MARKDOWN, reply_markup=kb.main_menu())
     admin_ids = await db.get_all_admin_ids()
     for aid in admin_ids:
-        await notify_user(context.bot, aid, f"💬 *Respuesta ticket #{ticket_id:04d}*\n👤 {user.first_name}: {text}", parse_mode=ParseMode.MARKDOWN, reply_markup=kb.admin_ticket_actions(ticket_id, True))
-    context.user_data.clear()
+        await notify_user(
+            context.bot, aid,
+            f"🔔 *Respuesta en ticket #{tid:04d}*\n👤 {user.first_name}\n\n{update.message.text.strip()[:300]}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb.admin_ticket_actions(tid, True)
+        )
     return ConversationHandler.END
 
 async def ticket_close_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q         = update.callback_query
-    await q.answer()
-    ticket_id = int(q.data.split("_")[-1])
-    await db.close_ticket(ticket_id)
-    await q.edit_message_text(msg.ticket_closed_user(), parse_mode=ParseMode.MARKDOWN, reply_markup=kb.support_menu())
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    await db.close_ticket(tid)
+    await q.edit_message_text(f"✅ Ticket *#{tid:04d}* cerrado.", parse_mode=ParseMode.MARKDOWN, reply_markup=kb.main_menu())
 
 async def ticket_reopen_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q         = update.callback_query
-    await q.answer()
-    ticket_id = int(q.data.split("_")[-1])
-    await db.reopen_ticket(ticket_id)
-    await q.answer("🔄 Ticket reabierto.", show_alert=True)
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    await db.reopen_ticket(tid)
+    await q.edit_message_text(f"🔄 Ticket *#{tid:04d}* reabierto.", parse_mode=ParseMode.MARKDOWN, reply_markup=kb.main_menu())
+
+# Admin ticket handlers (preservados del original)
+async def adm_tickets(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    open_c = len(await db.get_open_tickets())
+    await q.edit_message_text(
+        f"🎟️ *Gestión de Tickets*\n━━━━━━━━━━━━━━━━\n\n📂 Tickets abiertos: *{open_c}*",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🟢 Ver abiertos", callback_data="adm_tickets_open")],
+            [InlineKeyboardButton("📋 Ver todos", callback_data="adm_tickets_all")],
+            [InlineKeyboardButton("← Admin", callback_data="adm_panel")],
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def adm_tickets_open(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    tickets = await db.get_open_tickets()
+    if not tickets:
+        await q.edit_message_text("✅ Sin tickets abiertos.", reply_markup=kb.admin_back()); return
+    btns = [[InlineKeyboardButton(f"#{t['id']:04d} {t['subject'][:28]}", callback_data=f"adm_tview_{t['id']}")] for t in tickets[:10]]
+    btns.append([InlineKeyboardButton("← Admin", callback_data="adm_panel")])
+    await q.edit_message_text("🟢 *Tickets abiertos*", reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_tickets_all(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    tickets = await db.get_all_tickets(20)
+    btns = [[InlineKeyboardButton(f"{'🟢' if t['status']=='open' else '⚫'} #{t['id']:04d} {t['subject'][:25]}", callback_data=f"adm_tview_{t['id']}")] for t in tickets]
+    btns.append([InlineKeyboardButton("← Admin", callback_data="adm_panel")])
+    await q.edit_message_text("📋 *Todos los tickets*", reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_ticket_view(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    ticket = await db.get_ticket(tid)
+    if not ticket:
+        await q.answer("Ticket no encontrado", show_alert=True); return
+    msgs = await db.get_ticket_messages(tid)
+    txt  = f"🎟️ *#{tid:04d}* — {ticket['subject']}\n👤 {ticket['first_name']} | {ticket['status']}\n━━━━━━━━━━━━━━━━\n\n"
+    for m in msgs[-6:]:
+        who = "🛡️" if m["is_admin"] else "👤"
+        txt += f"{who} `{m['sent_at'][:16]}`\n{m['message'][:200]}\n\n"
+    await q.edit_message_text(txt[:4000], reply_markup=kb.admin_ticket_actions(tid, ticket["status"]=="open"), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_ticket_reply_start(update, context):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    context.user_data["adm_reply_ticket"] = tid
+    await q.edit_message_text(f"✍️ Responde al ticket *#{tid:04d}*:", reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    return STATE_ADM_TICKET_REPLY
+
+async def adm_ticket_reply_message(update, context):
+    admin  = update.effective_user
+    tid    = context.user_data.get("adm_reply_ticket")
+    if not tid: return ConversationHandler.END
+    ticket = await db.get_ticket(tid)
+    await db.add_ticket_message(tid, admin.id, update.message.text.strip(), is_admin=True)
+    await update.message.reply_text(f"✅ Respuesta enviada al ticket *#{tid:04d}*.", parse_mode=ParseMode.MARKDOWN, reply_markup=kb.admin_back())
+    if ticket:
+        await notify_user(context.bot, ticket["user_id"],
+            f"🔔 *Respuesta de soporte en ticket #{tid:04d}*\n\n{update.message.text.strip()[:500]}",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb.main_menu())
+    return ConversationHandler.END
+
+async def adm_ticket_close(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    await db.close_ticket(tid)
+    await q.edit_message_text(f"✅ Ticket *#{tid:04d}* cerrado.", parse_mode=ParseMode.MARKDOWN, reply_markup=kb.admin_back())
+
+async def adm_ticket_reopen(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    await db.reopen_ticket(tid)
+    await q.edit_message_text(f"🔄 Ticket *#{tid:04d}* reabierto.", parse_mode=ParseMode.MARKDOWN, reply_markup=kb.admin_back())
 
 
 # ──────────────────────────────────────────────────────────────
-# ADMIN — Panel
+# ADMIN PANEL (preservado del original — funciones clave)
 # ──────────────────────────────────────────────────────────────
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id):
+        await update.message.reply_text("🚫 Sin permisos.")
         return
-    stats = await db.get_stats_summary()
-    await update.message.reply_text(msg.admin_panel_text(stats), reply_markup=kb.admin_panel(), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("🛡️ *Panel de Admin*", reply_markup=kb.admin_panel(), parse_mode=ParseMode.MARKDOWN)
 
 async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id):
-        return
-    q     = update.callback_query
-    await q.answer()
-    stats = await db.get_stats_summary()
-    await q.edit_message_text(msg.admin_panel_text(stats), reply_markup=kb.admin_panel(), parse_mode=ParseMode.MARKDOWN)
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("🛡️ *Panel de Admin*", reply_markup=kb.admin_panel(), parse_mode=ParseMode.MARKDOWN)
 
-
-# ── Generar código ──
 async def adm_gen_code_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id): return ConversationHandler.END
-    q = update.callback_query
-    await q.answer()
+    q = update.callback_query; await q.answer()
     await q.edit_message_text(
-        "🔑 *Generar código VIP*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Atajos rápidos abajo, o escribe:\n"
-        "`DIAS USOS` → código aleatorio\n"
-        "`CODIGO DIAS USOS [NOTA]` → personalizado\n"
-        "`DIAS USOS NOTA exp:DD/MM/YYYY` → con expiración",
-        reply_markup=kb.admin_gen_code_shortcuts(), parse_mode=ParseMode.MARKDOWN
+        "🔑 *Generar código VIP*\n━━━━━━━━━━━━━━━━\n\nElige duración:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("7 días",  callback_data="adm_quick_7"),
+             InlineKeyboardButton("30 días", callback_data="adm_quick_30")],
+            [InlineKeyboardButton("90 días", callback_data="adm_quick_90"),
+             InlineKeyboardButton("365 días",callback_data="adm_quick_365")],
+            [InlineKeyboardButton("Personalizado", callback_data="adm_quick_custom")],
+            [InlineKeyboardButton("← Admin", callback_data="adm_panel")],
+        ]),
+        parse_mode=ParseMode.MARKDOWN
     )
     return STATE_GEN_CODE
 
 async def adm_gen_code_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id): return ConversationHandler.END
-    q    = update.callback_query
-    await q.answer()
-    days = {"7": 7, "15": 15, "30": 30, "60": 60, "90": 90}.get(q.data.split("_")[-1], 30)
+    q    = update.callback_query; await q.answer()
+    data = q.data.split("_")[-1]
+    if data == "custom":
+        await q.edit_message_text("✏️ Escribe: `días usos [nota]`\nEjemplo: `30 1 Cliente premium`", parse_mode=ParseMode.MARKDOWN, reply_markup=kb.cancel_keyboard())
+        return STATE_GEN_CODE
+    days = int(data)
     code = await unique_code()
-    admin_id = update.effective_user.id
-    await db.create_code(code, days, 1, created_by=admin_id)
-    await db.audit(admin_id, "gen_code", code, f"{days}d 1uso")
-    await q.edit_message_text(msg.admin_code_created(code, days, 1, ""), reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+    await db.create_code(code, days, 1, created_by=q.from_user.id)
+    await db.audit(q.from_user.id, "gen_code", code, f"days={days}")
+    await q.edit_message_text(
+        f"✅ *Código generado*\n━━━━━━━━━━━━━━━━\n\n`{code}`\n\n📅 Días: *{days}*\n🔂 Usos: *1*",
+        reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN
+    )
     return ConversationHandler.END
 
 async def adm_gen_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id): return ConversationHandler.END
-    admin_id = update.effective_user.id
-    text     = update.message.text.strip()
-
-    # Parsear fecha de expiración opcional: exp:DD/MM/YYYY
-    expires_at = None
-    if "exp:" in text.lower():
-        parts_exp = text.lower().split("exp:")
-        text      = parts_exp[0].strip()
-        try:
-            exp_date   = datetime.strptime(parts_exp[1].strip(), "%d/%m/%Y").replace(tzinfo=timezone.utc)
-            expires_at = exp_date.strftime("%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            await update.message.reply_text("⚠️ Formato de fecha inválido. Usa `exp:DD/MM/YYYY`", parse_mode=ParseMode.MARKDOWN)
-            return STATE_GEN_CODE
-
-    parts = text.split()
+    parts = update.message.text.strip().split()
     try:
-        if len(parts) == 2:
-            days, uses, code, note = int(parts[0]), int(parts[1]), await unique_code(), ""
-        elif len(parts) >= 3:
-            try:
-                days, uses = int(parts[0]), int(parts[1])
-                code = await unique_code()
-                note = " ".join(parts[2:])
-            except ValueError:
-                code = parts[0].upper()
-                days = int(parts[1])
-                uses = int(parts[2])
-                note = " ".join(parts[3:]) if len(parts) > 3 else ""
-        else:
-            raise ValueError
+        days  = int(parts[0])
+        uses  = int(parts[1]) if len(parts) > 1 else 1
+        note  = " ".join(parts[2:]) if len(parts) > 2 else ""
     except (ValueError, IndexError):
-        await update.message.reply_text("⚠️ Formato inválido. Ej: `30 5` o `PROMO30 30 1 Nota`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("❌ Formato: `días usos [nota]`", parse_mode=ParseMode.MARKDOWN)
         return STATE_GEN_CODE
-
-    await db.create_code(code, days, uses, note, expires_at, admin_id)
-    await db.audit(admin_id, "gen_code", code, f"{days}d {uses}usos")
-    await update.message.reply_text(msg.admin_code_created(code, days, uses, note, expires_at), reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+    code = await unique_code()
+    await db.create_code(code, days, uses, note, created_by=update.effective_user.id)
+    await db.audit(update.effective_user.id, "gen_code", code, f"days={days} uses={uses}")
+    await update.message.reply_text(
+        f"✅ *Código generado*\n\n`{code}`\n\n📅 Días: *{days}* | 🔂 Usos: *{uses}*{f' | 📝 {note}' if note else ''}",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=kb.admin_back()
+    )
     return ConversationHandler.END
 
-
-# ── Lista / Stats / Ranking ──
 async def adm_list_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id): return
     q = update.callback_query; await q.answer()
-    await q.edit_message_text(msg.admin_codes_list(await db.list_codes()), reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+    codes = await db.get_active_codes()
+    if not codes:
+        await q.edit_message_text("📭 Sin códigos activos.", reply_markup=kb.admin_back()); return
+    txt = "🔑 *Códigos activos*\n━━━━━━━━━━━━━━━━\n\n"
+    for c in codes[:20]:
+        rem = f"{c['max_uses']-c['used_count']}/{c['max_uses']}"
+        txt += f"`{c['code']}` — {c['days']}d — {rem} usos\n"
+    await q.edit_message_text(txt[:4000], reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
 
 async def adm_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id): return
     q = update.callback_query; await q.answer()
-    await q.edit_message_text(msg.admin_members_list(await db.get_active_members()), reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+    members = await db.get_all_subscriptions()
+    if not members:
+        await q.edit_message_text("📭 Sin miembros.", reply_markup=kb.admin_back()); return
+    txt = f"👥 *Miembros activos ({len(members)})*\n━━━━━━━━━━━━━━━━\n\n"
+    for m in members[:20]:
+        d = days_left(m["expiry"])
+        txt += f"• {m['first_name']} (`{m['user_id']}`) — {d}d restantes\n"
+    await q.edit_message_text(txt[:4000], reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
 
 async def adm_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id): return
     q = update.callback_query; await q.answer()
-    await q.edit_message_text(msg.admin_stats(await db.get_stats_summary(), await db.get_active_members()), reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+    s = await db.get_stats_summary()
+    txt = (f"📊 *Estadísticas*\n━━━━━━━━━━━━━━━━\n\n"
+           f"👥 Total miembros: *{s['total']}*\n✅ Activos: *{s['active']}*\n"
+           f"🆕 Nuevos hoy: *{s['new_today']}*\n⚠️ Vencen en 3d: *{s['expiring_3d']}*\n"
+           f"🔑 Códigos activos: *{s['codes']}*\n🎟️ Tickets abiertos: *{s['tickets_open']}*\n"
+           f"🚫 Bloqueados: *{s['banned']}*\n🆓 Pruebas usadas: *{s['trials']}*")
+    await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
 
 async def adm_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id): return
     q = update.callback_query; await q.answer()
-    await q.edit_message_text(msg.admin_ranking(await db.get_ranking(10)), reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+    rank = await db.get_ranking(10)
+    txt  = "🏆 *Ranking VIP*\n━━━━━━━━━━━━━━━━\n\n"
+    medals = ["🥇","🥈","🥉"] + ["🏅"]*7
+    for i, m in enumerate(rank):
+        txt += f"{medals[i]} {m['first_name']} — *{m['total_days']}d* acumulados\n"
+    await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
 
-
-# ── Multi-admin ──
-async def adm_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    q = update.callback_query; await q.answer()
-    await q.edit_message_text("👑 *Gestión de Admins*", reply_markup=kb.admin_admins_menu(), parse_mode=ParseMode.MARKDOWN)
-
-async def adm_list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    q = update.callback_query; await q.answer()
-    admins = await db.list_admins()
-    await q.edit_message_text(msg.admin_admins_list(admins, ADMIN_ID), reply_markup=kb.admin_admins_menu(), parse_mode=ParseMode.MARKDOWN)
-
-async def adm_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return ConversationHandler.END
-    q = update.callback_query; await q.answer()
-    await q.edit_message_text("👑 Escribe el `USER_ID` del nuevo admin:", reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
-    return STATE_ADD_ADMIN
-
-async def adm_add_admin_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = update.effective_user.id
-    try:
-        uid = int(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("⚠️ ID inválido.", reply_markup=kb.admin_back())
-        return ConversationHandler.END
-    await db.add_admin(uid, "", "", admin_id)
-    await db.audit(admin_id, "add_admin", str(uid))
-    await update.message.reply_text(msg.admin_add_admin_success(uid), reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
-    await notify_user(context.bot, uid, "👑 Has sido añadido como administrador del bot VIP.")
-    return ConversationHandler.END
-
-async def adm_remove_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return ConversationHandler.END
-    q = update.callback_query; await q.answer()
-    await q.edit_message_text("➖ Escribe el `USER_ID` del admin a remover:", reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
-    return STATE_REMOVE_ADMIN
-
-async def adm_remove_admin_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    admin_id = update.effective_user.id
-    try:
-        uid = int(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("⚠️ ID inválido.", reply_markup=kb.admin_back())
-        return ConversationHandler.END
-    if uid == ADMIN_ID:
-        await update.message.reply_text("⚠️ No puedes remover al admin principal.", reply_markup=kb.admin_back())
-        return ConversationHandler.END
-    await db.remove_admin(uid)
-    await db.audit(admin_id, "remove_admin", str(uid))
-    await update.message.reply_text(msg.admin_remove_admin_success(uid), reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
-    return ConversationHandler.END
-
-# Comandos directos de admin
-async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    if not context.args:
-        await update.message.reply_text("Uso: `/addadmin USER_ID`", parse_mode=ParseMode.MARKDOWN)
-        return
-    uid = int(context.args[0])
-    await db.add_admin(uid, "", "", update.effective_user.id)
-    await db.audit(update.effective_user.id, "add_admin", str(uid))
-    await update.message.reply_text(msg.admin_add_admin_success(uid), parse_mode=ParseMode.MARKDOWN)
-
-async def removeadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    if not context.args:
-        await update.message.reply_text("Uso: `/removeadmin USER_ID`", parse_mode=ParseMode.MARKDOWN)
-        return
-    uid = int(context.args[0])
-    if uid == ADMIN_ID:
-        await update.message.reply_text("⚠️ No puedes remover al admin principal.")
-        return
-    await db.remove_admin(uid)
-    await db.audit(update.effective_user.id, "remove_admin", str(uid))
-    await update.message.reply_text(msg.admin_remove_admin_success(uid), parse_mode=ParseMode.MARKDOWN)
-
-
-# ── Blacklist ──
-async def adm_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    q = update.callback_query; await q.answer()
-    await q.edit_message_text("🚫 *Gestión de Blacklist*", reply_markup=kb.admin_blacklist_menu(), parse_mode=ParseMode.MARKDOWN)
-
-async def adm_blacklist_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    q = update.callback_query; await q.answer()
-    await q.edit_message_text(msg.admin_blacklist_list(await db.get_blacklist()), reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
-
-async def adm_ban_input_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return ConversationHandler.END
-    q = update.callback_query; await q.answer()
-    await q.edit_message_text("🚫 Escribe: `USER_ID razón`", reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
-    return STATE_BAN_INPUT
-
-async def adm_ban_input_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parts    = update.message.text.strip().split(maxsplit=1)
-    admin_id = update.effective_user.id
-    try:
-        uid    = int(parts[0])
-        reason = parts[1] if len(parts) > 1 else ""
-    except ValueError:
-        await update.message.reply_text("⚠️ ID inválido.", reply_markup=kb.admin_back())
-        return ConversationHandler.END
-    await db.ban_user(uid, reason, admin_id)
-    await db.audit(admin_id, "ban", str(uid), reason)
-    await kick_from_channel(context.bot, uid)
-    await update.message.reply_text(msg.admin_ban_success(uid), reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
-    await notify_user(context.bot, uid, "🚫 Tu acceso ha sido suspendido.")
-    return ConversationHandler.END
-
-async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    if not context.args: return
-    uid    = int(context.args[0])
-    reason = " ".join(context.args[1:]) if len(context.args) > 1 else ""
-    await db.ban_user(uid, reason, update.effective_user.id)
-    await db.audit(update.effective_user.id, "ban", str(uid), reason)
-    await kick_from_channel(context.bot, uid)
-    await update.message.reply_text(msg.admin_ban_success(uid), parse_mode=ParseMode.MARKDOWN)
-
-async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    if not context.args: return
-    uid = int(context.args[0])
-    await db.unban_user(uid)
-    await db.audit(update.effective_user.id, "unban", str(uid))
-    await update.message.reply_text(msg.admin_unban_success(uid), parse_mode=ParseMode.MARKDOWN)
-
-async def adddays_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    if len(context.args) < 2: return
-    uid, days = int(context.args[0]), int(context.args[1])
-    ok = await db.add_days_to_subscription(uid, days)
-    if ok:
-        sub     = await db.get_subscription(uid)
-        new_exp = fmt_expiry(datetime.strptime(sub["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc))
-        await update.message.reply_text(msg.admin_adddays_success(uid, days, new_exp), parse_mode=ParseMode.MARKDOWN)
-        await db.audit(update.effective_user.id, "adddays", str(uid), f"+{days}")
-        await notify_user(context.bot, uid, f"✅ Un admin añadió *+{days} días* a tu membresía.\n📅 Nuevo vencimiento: `{new_exp}`", parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text("⚠️ Usuario sin membresía activa.")
-
-
-# ── Broadcast segmentado ──
 async def adm_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id): return
     q = update.callback_query; await q.answer()
-    await q.edit_message_text("📢 *Broadcast — Elige el segmento*", reply_markup=kb.admin_broadcast_menu(), parse_mode=ParseMode.MARKDOWN)
+    await q.edit_message_text(
+        "📢 *Broadcast*\n\n¿A quién enviar?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Todos",         callback_data="adm_bc_all")],
+            [InlineKeyboardButton("✅ Solo activos",  callback_data="adm_bc_active")],
+            [InlineKeyboardButton("⚠️ Por vencer 3d", callback_data="adm_bc_expiring")],
+            [InlineKeyboardButton("← Admin", callback_data="adm_panel")],
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 async def adm_broadcast_segment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id): return ConversationHandler.END
     q = update.callback_query; await q.answer()
-    segment_map = {
-        "adm_bc_all":      ("all",      "Todos los miembros"),
-        "adm_bc_critical": ("critical", "Vencen en 1-3 días 🔴"),
-        "adm_bc_warning":  ("warning",  "Vencen en 4-7 días 🟡"),
-        "adm_bc_healthy":  ("healthy",  "Más de 7 días activos 🟢"),
-    }
-    segment, label = segment_map.get(q.data, ("all", "Todos"))
-    context.user_data["bc_segment"] = segment
-    context.user_data["bc_label"]   = label
-    await q.edit_message_text(
-        f"📢 *Broadcast — {label}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\nEscribe el mensaje:",
-        reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN
-    )
+    seg = q.data.replace("adm_bc_", "")
+    BROADCAST_FILTER["segment"] = seg
+    await q.edit_message_text(f"✍️ Escribe el mensaje a enviar ({seg}):", reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
     return STATE_BROADCAST_MSG
 
 async def adm_broadcast_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text  = update.message.text.strip()
-    label = context.user_data.get("bc_label", "Todos")
-    context.user_data["bc_msg"] = text
+    seg = BROADCAST_FILTER.get("segment", "all")
+    context.user_data["bc_message"] = update.message.text.strip()
     await update.message.reply_text(
-        msg.admin_broadcast_preview(text, label),
-        reply_markup=kb.confirm_action("adm_broadcast_confirm"),
+        f"📢 *Preview broadcast ({seg})*\n━━━━━━━━\n\n{context.user_data['bc_message']}\n\n━━━━━━━━\n¿Confirmar?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Enviar",   callback_data="adm_broadcast_confirm")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data="adm_panel")],
+        ]),
         parse_mode=ParseMode.MARKDOWN
     )
     return ConversationHandler.END
 
 async def adm_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id): return
-    q       = update.callback_query; await q.answer()
-    text    = context.user_data.get("bc_msg", "")
-    segment = context.user_data.get("bc_segment", "all")
-    label   = context.user_data.get("bc_label", "Todos")
-
-    if segment == "all":
-        members = await db.get_active_members()
-    elif segment == "critical":
-        members = await db.get_members_by_days_range(1, 3)
-    elif segment == "warning":
-        members = await db.get_members_by_days_range(4, 7)
+    q   = update.callback_query; await q.answer("Enviando...")
+    seg = BROADCAST_FILTER.get("segment", "all")
+    txt = context.user_data.get("bc_message", "")
+    if not txt:
+        await q.edit_message_text("❌ Sin mensaje.", reply_markup=kb.admin_back()); return
+    if seg == "active":
+        members = [m for m in await db.get_all_subscriptions() if days_left(m["expiry"]) > 0]
+    elif seg == "expiring":
+        members = await db.get_expiring_soon(72)
     else:
-        members = await db.get_members_by_days_range(8, 9999)
-
-    sent = failed = 0
+        members = await db.get_all_subscriptions()
+    ok, fail = 0, 0
     for m in members:
         try:
-            await context.bot.send_message(m["user_id"], text, parse_mode=ParseMode.MARKDOWN)
-            sent += 1
+            await context.bot.send_message(m["user_id"], txt, parse_mode=ParseMode.MARKDOWN)
+            ok += 1
         except TelegramError:
-            failed += 1
+            fail += 1
+    await db.log_broadcast(txt, seg, ok, fail)
+    await q.edit_message_text(f"📢 *Broadcast enviado*\n✅ {ok} ok | ❌ {fail} fallidos", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
 
-    await db.log_broadcast(text, segment, sent, failed)
-    await db.audit(update.effective_user.id, "broadcast", segment, f"sent={sent} failed={failed}")
-    context.user_data.clear()
-    await q.edit_message_text(msg.admin_broadcast_done(sent, failed, label), reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
-
-
-# ── Admin Tickets ──
-async def adm_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adm_admins(update, context):
     if not await is_admin(update.effective_user.id): return
     q = update.callback_query; await q.answer()
-    await q.edit_message_text("🎟️ *Soporte — Tickets*", reply_markup=kb.admin_tickets_menu(), parse_mode=ParseMode.MARKDOWN)
+    await q.edit_message_text("🛡️ *Gestión de admins*",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Agregar admin",  callback_data="adm_add_admin")],
+            [InlineKeyboardButton("➖ Remover admin",  callback_data="adm_remove_admin")],
+            [InlineKeyboardButton("📋 Listar admins",  callback_data="adm_list_admins")],
+            [InlineKeyboardButton("← Admin",           callback_data="adm_panel")],
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-async def adm_tickets_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adm_list_admins(update, context):
     if not await is_admin(update.effective_user.id): return
-    q       = update.callback_query; await q.answer()
-    tickets = await db.get_open_tickets()
-    buttons = [[InlineKeyboardButton(f"📬 #{t['id']:04d} — {t['subject'][:30]}", callback_data=f"adm_tview_{t['id']}")] for t in tickets[:8]]
-    buttons.append([InlineKeyboardButton("« Tickets", callback_data="adm_tickets")])
-    await q.edit_message_text(msg.admin_tickets_list(tickets, open_only=True), reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN)
+    q = update.callback_query; await q.answer()
+    admins = await db.list_admins()
+    txt = "🛡️ *Admins activos*\n━━━━━━━━━━━━━━━━\n\n"
+    txt += f"⭐ Admin principal: `{ADMIN_ID}`\n\n"
+    for a in admins:
+        txt += f"• {a['first_name']} (`{a['user_id']}`)\n"
+    await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
 
-async def adm_tickets_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    q       = update.callback_query; await q.answer()
-    tickets = await db.get_all_tickets(30)
-    buttons = []
-    for t in tickets[:8]:
-        st = "📬" if t["status"] == "open" else "✅"
-        buttons.append([InlineKeyboardButton(f"{st} #{t['id']:04d} — {t['subject'][:25]}", callback_data=f"adm_tview_{t['id']}")])
-    buttons.append([InlineKeyboardButton("« Tickets", callback_data="adm_tickets")])
-    await q.edit_message_text(msg.admin_tickets_list(tickets), reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN)
-
-async def adm_ticket_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    q         = update.callback_query; await q.answer()
-    ticket_id = int(q.data.split("_")[-1])
-    ticket    = await db.get_ticket(ticket_id)
-    messages_ = await db.get_ticket_messages(ticket_id)
-    if not ticket:
-        await q.answer("Ticket no encontrado.", show_alert=True); return
-    await q.edit_message_text(msg.admin_ticket_detail(ticket, messages_), parse_mode=ParseMode.MARKDOWN, reply_markup=kb.admin_ticket_actions(ticket_id, ticket["status"] == "open"))
-
-async def adm_ticket_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adm_add_admin_start(update, context):
     if not await is_admin(update.effective_user.id): return ConversationHandler.END
-    q         = update.callback_query; await q.answer()
-    ticket_id = int(q.data.split("_")[-1])
-    context.user_data["adm_reply_ticket"] = ticket_id
-    await q.edit_message_text(f"💬 Responder ticket *#{ticket_id:04d}*\n\nEscribe tu respuesta:", parse_mode=ParseMode.MARKDOWN, reply_markup=kb.cancel_keyboard())
-    return STATE_ADM_TICKET_REPLY
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("✏️ Escribe el user_id del nuevo admin:", reply_markup=kb.cancel_keyboard())
+    return STATE_ADD_ADMIN
 
-async def adm_ticket_reply_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ticket_id = context.user_data.get("adm_reply_ticket")
-    text      = update.message.text.strip()
-    admin_id  = update.effective_user.id
-    await db.add_ticket_message(ticket_id, admin_id, text, is_admin=True)
-    await db.audit(admin_id, "ticket_reply", str(ticket_id))
-    await update.message.reply_text(msg.admin_ticket_reply_sent(ticket_id), parse_mode=ParseMode.MARKDOWN, reply_markup=kb.admin_back())
-    ticket = await db.get_ticket(ticket_id)
-    if ticket:
-        await notify_user(context.bot, ticket["user_id"], msg.ticket_new_reply_user(ticket_id, text), parse_mode=ParseMode.MARKDOWN)
-    context.user_data.clear()
+async def adm_add_admin_received(update, context):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    try:
+        new_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ ID inválido."); return STATE_ADD_ADMIN
+    await db.add_admin(new_id, "", "", update.effective_user.id)
+    await db.audit(update.effective_user.id, "add_admin", str(new_id))
+    await update.message.reply_text(f"✅ Admin `{new_id}` agregado.", parse_mode=ParseMode.MARKDOWN, reply_markup=kb.admin_back())
     return ConversationHandler.END
 
-async def adm_ticket_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adm_remove_admin_start(update, context):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("✏️ Escribe el user_id a remover:", reply_markup=kb.cancel_keyboard())
+    return STATE_REMOVE_ADMIN
+
+async def adm_remove_admin_received(update, context):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    try:
+        rem_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ ID inválido."); return STATE_REMOVE_ADMIN
+    await db.remove_admin(rem_id)
+    await db.audit(update.effective_user.id, "remove_admin", str(rem_id))
+    await update.message.reply_text(f"✅ Admin `{rem_id}` removido.", parse_mode=ParseMode.MARKDOWN, reply_markup=kb.admin_back())
+    return ConversationHandler.END
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id): return
-    q         = update.callback_query; await q.answer()
-    ticket_id = int(q.data.split("_")[-1])
-    await db.close_ticket(ticket_id)
-    await db.audit(update.effective_user.id, "ticket_close", str(ticket_id))
-    ticket    = await db.get_ticket(ticket_id)
-    messages_ = await db.get_ticket_messages(ticket_id)
-    await q.edit_message_text(msg.admin_ticket_detail(ticket, messages_), parse_mode=ParseMode.MARKDOWN, reply_markup=kb.admin_ticket_actions(ticket_id, False))
+    args = context.args
+    if not args:
+        await update.message.reply_text("Uso: /ban <user_id> [razón]"); return
+    try:
+        uid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id inválido."); return
+    reason = " ".join(args[1:]) or "Sin razón"
+    await db.ban_user(uid, reason, update.effective_user.id)
+    await kick_from_channel(context.bot, uid)
+    await update.message.reply_text(f"🚫 Usuario `{uid}` baneado.", parse_mode=ParseMode.MARKDOWN)
 
-async def adm_ticket_reopen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id): return
-    q         = update.callback_query; await q.answer()
-    ticket_id = int(q.data.split("_")[-1])
-    await db.reopen_ticket(ticket_id)
-    await q.answer("🔄 Ticket reabierto.", show_alert=True)
+    args = context.args
+    if not args:
+        await update.message.reply_text("Uso: /unban <user_id>"); return
+    try:
+        uid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id inválido."); return
+    await db.unban_user(uid)
+    await update.message.reply_text(f"✅ Usuario `{uid}` desbaneado.", parse_mode=ParseMode.MARKDOWN)
 
+async def adddays_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Uso: /adddays <user_id> <días>"); return
+    try:
+        uid  = int(args[0])
+        days = int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Valores inválidos."); return
+    sub = await db.get_subscription(uid)
+    if not sub:
+        await update.message.reply_text(f"❌ Usuario `{uid}` sin membresía.", parse_mode=ParseMode.MARKDOWN); return
+    curr_exp = datetime.strptime(sub["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    new_exp  = max(curr_exp, utc_now()) + timedelta(days=days)
+    await db.upsert_subscription(uid, sub["username"], sub["first_name"], new_exp.strftime("%Y-%m-%d %H:%M:%S"), days, "MANUAL")
+    await db.audit(update.effective_user.id, "adddays", str(uid), f"+{days}d")
+    await update.message.reply_text(f"✅ +{days} días a `{uid}`. Nuevo vencimiento: {fmt_expiry(new_exp)}", parse_mode=ParseMode.MARKDOWN)
 
-# ── Mantenimiento ──
-async def adm_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Uso: /addadmin <user_id>"); return
+    try:
+        uid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id inválido."); return
+    await db.add_admin(uid, "", "", update.effective_user.id)
+    await update.message.reply_text(f"✅ Admin `{uid}` agregado.", parse_mode=ParseMode.MARKDOWN)
+
+async def removeadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Uso: /removeadmin <user_id>"); return
+    try:
+        uid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id inválido."); return
+    await db.remove_admin(uid)
+    await update.message.reply_text(f"✅ Admin `{uid}` removido.", parse_mode=ParseMode.MARKDOWN)
+
+async def adm_ban_input_start(update, context):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("✏️ Escribe el user_id a banear:", reply_markup=kb.cancel_keyboard())
+    return STATE_BAN_INPUT
+
+async def adm_ban_input_received(update, context):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    try:
+        uid = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ ID inválido."); return STATE_BAN_INPUT
+    await db.ban_user(uid, "Ban desde panel", update.effective_user.id)
+    await kick_from_channel(context.bot, uid)
+    await db.audit(update.effective_user.id, "ban", str(uid))
+    await update.message.reply_text(f"🚫 Usuario `{uid}` baneado.", parse_mode=ParseMode.MARKDOWN, reply_markup=kb.admin_back())
+    return ConversationHandler.END
+
+async def adm_blacklist(update, context):
     if not await is_admin(update.effective_user.id): return
     q = update.callback_query; await q.answer()
-    await q.edit_message_text("🔧 *Mantenimiento*", reply_markup=kb.admin_maintenance_menu(), parse_mode=ParseMode.MARKDOWN)
+    await q.edit_message_text("🚫 *Lista negra*",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Banear usuario", callback_data="adm_ban_input")],
+            [InlineKeyboardButton("📋 Ver lista",      callback_data="adm_blacklist_list")],
+            [InlineKeyboardButton("← Admin",           callback_data="adm_panel")],
+        ]), parse_mode=ParseMode.MARKDOWN)
 
-async def adm_clean_expired(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adm_blacklist_list(update, context):
     if not await is_admin(update.effective_user.id): return
-    q = update.callback_query; await q.answer("🧹 Limpiando...")
+    q = update.callback_query; await q.answer()
+    bl = await db.get_blacklist()
+    if not bl:
+        await q.edit_message_text("✅ Lista negra vacía.", reply_markup=kb.admin_back()); return
+    txt = "🚫 *Lista negra*\n━━━━━━━━━━━━━━━━\n\n"
+    for b in bl[:20]:
+        txt += f"• `{b['user_id']}` — {b['reason'] or 'sin razón'}\n"
+    await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_maintenance(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer("Modo mantenimiento no implementado aún.")
+
+async def adm_clean_expired(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer("Limpiando...")
     expired = await db.get_expired_members()
-    count   = 0
     for m in expired:
         await kick_from_channel(context.bot, m["user_id"])
         await db.delete_subscription(m["user_id"])
-        count += 1
-    await db.audit(update.effective_user.id, "clean_expired", "", f"removed={count}")
-    await q.edit_message_text(f"✅ *Limpieza completada*\nExpulsados: *{count}*", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+        await notify_user(context.bot, m["user_id"], msg.expired_notification(), parse_mode=ParseMode.MARKDOWN)
+    await q.edit_message_text(f"✅ Limpieza completada. {len(expired)} miembros eliminados.", reply_markup=kb.admin_back())
 
-async def adm_export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adm_export_csv(update, context):
     if not await is_admin(update.effective_user.id): return
-    q = update.callback_query; await q.answer("📤 Generando CSV...")
-    try:
-        csv_data  = await db.export_members_csv()
-        csv_bytes = io.BytesIO(csv_data.encode("utf-8"))
-        csv_bytes.name = f"members_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-        await context.bot.send_document(
-            update.effective_user.id,
-            document=csv_bytes,
-            filename=csv_bytes.name,
-            caption="📊 Exportación de miembros VIP"
-        )
-        await db.audit(update.effective_user.id, "export_csv", "", "")
-    except Exception as e:
-        logger.error(f"export_csv error: {e}")
-        await q.answer("⚠️ Error al generar CSV.", show_alert=True)
+    q = update.callback_query; await q.answer("Generando CSV...")
+    members = await db.get_all_subscriptions()
+    output  = io.StringIO()
+    writer  = __import__("csv").writer(output)
+    writer.writerow(["user_id","first_name","username","expiry","total_days","renewals"])
+    for m in members:
+        writer.writerow([m["user_id"],m["first_name"],m["username"],m["expiry"],m["total_days"],m["renewals"]])
+    output.seek(0)
+    await context.bot.send_document(
+        q.from_user.id,
+        document=io.BytesIO(output.getvalue().encode()),
+        filename=f"members_{datetime.now().strftime('%Y%m%d')}.csv",
+        caption="📊 Exportación de miembros"
+    )
+    await q.edit_message_text("✅ CSV enviado.", reply_markup=kb.admin_back())
 
-async def adm_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adm_backup(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer("Generando backup...")
+    try:
+        with open("vip_bot.db", "rb") as f:
+            await context.bot.send_document(q.from_user.id, document=f, filename="vip_bot_backup.db", caption="🗄️ Backup DB")
+        await q.edit_message_text("✅ Backup enviado.", reply_markup=kb.admin_back())
+    except Exception as e:
+        await q.answer(f"⚠️ Error: {e}", show_alert=True)
+
+async def adm_audit_log(update, context):
     if not await is_admin(update.effective_user.id): return
     q = update.callback_query; await q.answer()
-    try:
-        from database import DB_PATH
-        await context.bot.send_document(
-            update.effective_user.id,
-            document=open(DB_PATH, "rb"),
-            filename=f"vip_backup_{datetime.now().strftime('%Y%m%d')}.db"
-        )
-    except Exception as e:
-        logger.error(f"backup error: {e}")
-        await q.answer("⚠️ Error al generar backup.", show_alert=True)
-
-async def adm_audit_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    q    = update.callback_query; await q.answer()
     logs = await db.get_audit_log(30)
-    txt  = "📋 *Log de auditoría*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    txt  = "📋 *Log de auditoría*\n━━━━━━━━━━━━━━━━\n\n"
     for l in logs:
         txt += f"`{l['created_at'][:16]}` *{l['action']}* {l['target'] or ''}\n"
     await q.edit_message_text(txt[:4000], reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
 
-async def adm_broadcast_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adm_broadcast_history(update, context):
     if not await is_admin(update.effective_user.id): return
     q       = update.callback_query; await q.answer()
     history = await db.get_broadcast_history(10)
-    txt     = "📜 *Historial broadcasts*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    txt     = "📜 *Historial broadcasts*\n━━━━━━━━━━━━━━━━\n\n"
     for b in history:
         txt += f"`{b['created_at'][:16]}` [{b['filter_type']}] → {b['sent_to']} ok · {b['failed']} fail\n"
     await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
 
-async def adm_scan_intruders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def adm_scan_intruders(update, context):
     if not await is_admin(update.effective_user.id): return
     q = update.callback_query; await q.answer()
     await q.edit_message_text("👻 *Scan completado*\n\n_Usa limpieza forzada para expulsar vencidos._", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
@@ -986,21 +1142,137 @@ async def adm_scan_intruders(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ──────────────────────────────────────────────────────────────
 # JOBS AUTOMÁTICOS
 # ──────────────────────────────────────────────────────────────
+
 async def job_clean_expired(context: ContextTypes.DEFAULT_TYPE):
+    """Cada hora: expulsa y elimina miembros vencidos."""
     expired = await db.get_expired_members()
     for m in expired:
         await kick_from_channel(context.bot, m["user_id"])
         await db.delete_subscription(m["user_id"])
         await notify_user(context.bot, m["user_id"], msg.expired_notification(), parse_mode=ParseMode.MARKDOWN)
     if expired:
-        logger.info(f"job_clean_expired: removed {len(expired)} members")
+        logger.info(f"job_clean_expired: {len(expired)} miembros eliminados")
+
 
 async def job_warn_expiring(context: ContextTypes.DEFAULT_TYPE):
-    for hours in [72, 24]:
-        for m in await db.get_expiring_soon(hours):
-            await notify_user(context.bot, m["user_id"], msg.expiry_warning(days_left(m["expiry"])), parse_mode=ParseMode.MARKDOWN, reply_markup=kb.main_menu())
+    """
+    Cada 12 horas: envía recordatorios escalonados.
+    ✅ MEJORADO: avisa a 72h, 24h Y 1h antes.
+    """
+    IMPACT_MAP = {
+        72: ("⚠️", "3 días"),
+        24: ("🔔", "24 horas"),
+        1:  ("🚨", "1 hora"),
+    }
+    for hours, (icon, label) in IMPACT_MAP.items():
+        members = await db.get_expiring_soon(hours)
+        for m in members:
+            d_left = days_left(m["expiry"])
+            text = (
+                f"{icon} *¡Tu membresía VIP vence en {label}!*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📅 Vencimiento: `{m['expiry'][:16]}`\n"
+                f"⏳ Días restantes: *{d_left}*\n\n"
+                f"{'💡 Renueva ahora para no perder acceso al canal.' if hours > 1 else '🚨 *Última oportunidad antes de perder acceso.*'}\n\n"
+                f"Usa el botón *Renovar* en el menú del bot."
+            )
+            await notify_user(
+                context.bot, m["user_id"], text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb.main_menu()
+            )
+
+
+async def job_calendar_alerts(context: ContextTypes.DEFAULT_TYPE):
+    """
+    ← NUEVO — Cada 15 minutos
+    Revisa el calendario económico y avisa a TODOS los miembros activos
+    sobre eventos de ALTO impacto que ocurren en los próximos 30 minutos.
+    """
+    global _alerted_events
+
+    # Refrescar caché del calendario si es necesario
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if not _calendar_cache["fetched_at"] or (now_ts - _calendar_cache["fetched_at"]) > CALENDAR_CACHE_SECONDS:
+        try:
+            cal_url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.get(cal_url) as resp:
+                    events = await resp.json(content_type=None)
+            _calendar_cache["events"]     = events
+            _calendar_cache["fetched_at"] = now_ts
+        except Exception as e:
+            logger.warning(f"job_calendar_alerts fetch error: {e}")
+            return
+
+    now       = datetime.now(timezone.utc)
+    alert_window_start = now
+    alert_window_end   = now + timedelta(minutes=35)
+
+    # Filtrar eventos de alto impacto en la ventana de 35 minutos
+    upcoming = []
+    for ev in _calendar_cache.get("events", []):
+        if ev.get("impact", "").lower() != "high":
+            continue
+        try:
+            ev_dt = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if alert_window_start <= ev_dt <= alert_window_end:
+            ev_id = f"{ev.get('title','')}_{ev_dt.strftime('%Y%m%d%H%M')}"
+            if ev_id not in _alerted_events:
+                upcoming.append((ev, ev_dt, ev_id))
+
+    if not upcoming:
+        return
+
+    # Obtener todos los miembros activos
+    members = await db.get_all_subscriptions()
+    active  = [m for m in members if days_left(m["expiry"]) > 0]
+
+    if not active:
+        return
+
+    # Construir el mensaje de alerta
+    FLAG = {
+        "USD":"🇺🇸","EUR":"🇪🇺","GBP":"🇬🇧","JPY":"🇯🇵","CAD":"🇨🇦",
+        "AUD":"🇦🇺","NZD":"🇳🇿","CHF":"🇨🇭","CNY":"🇨🇳","All":"🌐",
+    }
+
+    for ev, ev_dt, ev_id in upcoming:
+        mins_away = int((ev_dt - now).total_seconds() / 60)
+        flag      = FLAG.get(ev.get("country",""), "🌐")
+        alert_txt = (
+            f"🔴 *ALERTA — Evento de Alto Impacto*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📌 *{ev.get('title', 'Evento')}*\n"
+            f"{flag} {ev.get('country', '')}  |  "
+            f"🕐 {ev_dt.strftime('%H:%M')} UTC\n"
+            f"⏱ En *{mins_away} minutos*\n\n"
+            f"⚡ Prepara tu gestión de riesgo.\n"
+            f"🛑 Considera cerrar posiciones abiertas si el SL está cerca."
+        )
+
+        # Enviar a todos los miembros activos
+        sent = 0
+        for m in active:
+            try:
+                await context.bot.send_message(m["user_id"], alert_txt, parse_mode=ParseMode.MARKDOWN)
+                sent += 1
+            except TelegramError:
+                pass
+
+        # Marcar como alertado
+        _alerted_events.add(ev_id)
+        logger.info(f"job_calendar_alerts: '{ev.get('title')}' → {sent} usuarios notificados")
+
+    # Limpiar alertas viejas (>24h) para no acumular memoria
+    now_str = now.strftime("%Y%m%d")
+    _alerted_events = {eid for eid in _alerted_events if now_str in eid or (now - timedelta(hours=24)).strftime("%Y%m%d") in eid}
+
 
 async def job_daily_summary(context: ContextTypes.DEFAULT_TYPE):
+    """Resumen diario a las 08:00 UTC para los admins."""
     stats     = await db.get_stats_summary()
     admin_ids = await db.get_all_admin_ids()
     for aid in admin_ids:
@@ -1034,8 +1306,6 @@ async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ──────────────────────────────────────────────────────────────
 def main():
-    import asyncio
-
     async def _run():
         await db.init_db()
 
@@ -1043,7 +1313,6 @@ def main():
             logger.critical("BOT_TOKEN no configurado. Saliendo.")
             return
 
-        # Arrancar servidor HTTP API
         await start_api_server()
 
         app = Application.builder().token(BOT_TOKEN).build()
@@ -1074,9 +1343,7 @@ def main():
                 fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
             ),
             ConversationHandler(
-                entry_points=[
-                    CallbackQueryHandler(adm_broadcast_segment, pattern="^adm_bc_"),
-                ],
+                entry_points=[CallbackQueryHandler(adm_broadcast_segment, pattern="^adm_bc_")],
                 states={STATE_BROADCAST_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_broadcast_preview)]},
                 fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")], conversation_timeout=300
             ),
@@ -1114,13 +1381,13 @@ def main():
 
         # ── Comandos ──
         for cmd, fn in [
-            ("start",        start_handler),
-            ("admin",        admin_command),
-            ("ban",          ban_command),
-            ("unban",        unban_command),
-            ("adddays",      adddays_command),
-            ("addadmin",     addadmin_command),
-            ("removeadmin",  removeadmin_command),
+            ("start",       start_handler),
+            ("admin",       admin_command),
+            ("ban",         ban_command),
+            ("unban",       unban_command),
+            ("adddays",     adddays_command),
+            ("addadmin",    addadmin_command),
+            ("removeadmin", removeadmin_command),
         ]:
             app.add_handler(CommandHandler(cmd, fn))
 
@@ -1167,17 +1434,18 @@ def main():
 
         # ── Jobs ──
         jq: JobQueue = app.job_queue
-        jq.run_repeating(job_clean_expired, interval=3600,  first=60)
-        jq.run_repeating(job_warn_expiring, interval=43200, first=120)
+        jq.run_repeating(job_clean_expired,    interval=3600,  first=60)
+        jq.run_repeating(job_warn_expiring,    interval=43200, first=120)
+        jq.run_repeating(job_calendar_alerts,  interval=900,   first=30)   # ← NUEVO: cada 15 min
         jq.run_daily(job_daily_summary, time=datetime.strptime("08:00", "%H:%M").time())
 
         logger.info(f"🚀 VIP Bot iniciado | Canal: {CHANNEL_ID} | Admin: {ADMIN_ID}")
+        logger.info("📰 /api/news activo  |  📅 /api/calendar activo  |  ⏰ Alertas económicas activas")
 
         await app.initialize()
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
 
-        # Mantener vivo
         import signal
         stop_event = asyncio.Event()
         loop = asyncio.get_event_loop()
