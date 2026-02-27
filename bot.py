@@ -1279,6 +1279,75 @@ async def job_daily_summary(context: ContextTypes.DEFAULT_TYPE):
         await notify_user(context.bot, aid, msg.daily_summary(stats), parse_mode=ParseMode.MARKDOWN)
 
 
+async def job_crypto_news(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Cada 30 minutos: publica las últimas noticias crypto/forex
+    en el canal VIP. Evita repetir noticias ya publicadas.
+    """
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    # Refrescar caché si es necesario
+    if not _news_cache["fetched_at"] or (now_ts - _news_cache["fetched_at"]) > NEWS_CACHE_SECONDS:
+        try:
+            feeds = [
+                "https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fes.cointelegraph.com%2Frss&count=5",
+                "https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fcointelegraph.com%2Frss&count=5",
+                "https://api.rss2json.com/v1/api.json?rss_url=https%3A%2F%2Fcryptonoticias.com%2Ffeed%2F&count=5",
+            ]
+            items = []
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                for url in feeds:
+                    try:
+                        async with session.get(url) as resp:
+                            data = await resp.json(content_type=None)
+                        if data.get("status") == "ok":
+                            for item in data.get("items", []):
+                                items.append({
+                                    "title":   item.get("title", ""),
+                                    "link":    item.get("link", ""),
+                                    "pubDate": item.get("pubDate", ""),
+                                    "source":  data.get("feed", {}).get("title", "Crypto News"),
+                                })
+                    except Exception as e:
+                        logger.warning(f"job_crypto_news feed error: {e}")
+                        continue
+
+            _news_cache["items"]      = items
+            _news_cache["fetched_at"] = now_ts
+            logger.info(f"job_crypto_news: {len(items)} noticias cargadas")
+        except Exception as e:
+            logger.warning(f"job_crypto_news fetch error: {e}")
+            return
+
+    # Publicar solo noticias nuevas (link no visto antes)
+    published = 0
+    for item in _news_cache.get("items", [])[:10]:
+        link = item.get("link", "")
+        if not link or link in _alerted_events:
+            continue
+
+        _alerted_events.add(link)
+        text = (
+            f"📰 *{item['title']}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔗 {link}\n"
+            f"📡 _{item['source']}_"
+        )
+        try:
+            await context.bot.send_message(
+                CHANNEL_ID, text,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=False
+            )
+            published += 1
+            await asyncio.sleep(2)  # evitar flood de mensajes
+        except TelegramError as e:
+            logger.warning(f"job_crypto_news send error: {e}")
+
+    if published:
+        logger.info(f"job_crypto_news: {published} noticias publicadas en canal {CHANNEL_ID}")
+
+
 # ──────────────────────────────────────────────────────────────
 # AUTO-RESPUESTA
 # ──────────────────────────────────────────────────────────────
@@ -1436,7 +1505,8 @@ def main():
         jq: JobQueue = app.job_queue
         jq.run_repeating(job_clean_expired,    interval=3600,  first=60)
         jq.run_repeating(job_warn_expiring,    interval=43200, first=120)
-        jq.run_repeating(job_calendar_alerts,  interval=900,   first=30)   # ← NUEVO: cada 15 min
+        jq.run_repeating(job_calendar_alerts,  interval=900,   first=30)   # cada 15 min
+        jq.run_repeating(job_crypto_news,      interval=1800,  first=90)   # ← NUEVO: noticias crypto cada 30 min
         jq.run_daily(job_daily_summary, time=datetime.strptime("08:00", "%H:%M").time())
 
         logger.info(f"🚀 VIP Bot iniciado | Canal: {CHANNEL_ID} | Admin: {ADMIN_ID}")
