@@ -86,16 +86,24 @@ async def api_user_info(request: web.Request) -> web.Response:
         user = verify_telegram_init_data(init_data, BOT_TOKEN or "")
         if user:
             uid = user.get("id", 0)
+        if uid == 0:
+            try:
+                params = dict(parse_qsl(init_data, keep_blank_values=True))
+                user_raw = json.loads(unquote(params.get("user", "{}")))
+                uid = user_raw.get("id", 0)
+                if uid:
+                    user = user_raw
+            except Exception:
+                pass
 
-    # Fallback: user_id directo (para desarrollo y cuando initData no está disponible)
     if uid == 0:
         try:
             uid = int(request.rel_url.query.get("user_id", "0"))
         except ValueError:
-            uid = 0
+            pass
 
     if uid == 0:
-        return web.json_response({"error": "missing initData"}, status=400, headers=cors_headers)
+        return web.json_response({"error": "missing user_id"}, status=400, headers=cors_headers)
 
     sub = await db.get_subscription(uid)
     if not sub:
