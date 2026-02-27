@@ -46,7 +46,8 @@ BOT_TOKEN  = os.getenv("BOT_TOKEN")
 ADMIN_ID   = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003738953503"))
 FREE_TRIAL_DAYS = 30
-API_PORT = int(os.getenv("API_PORT", "8080"))
+# Railway expone la variable PORT automáticamente
+API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "8080")))
 
 
 # ──────────────────────────────────────────────────────────────
@@ -78,20 +79,23 @@ async def api_user_info(request: web.Request) -> web.Response:
         return web.Response(status=204, headers=cors_headers)
 
     init_data = request.rel_url.query.get("initData", "")
-    if not init_data:
-        return web.json_response({"error": "missing initData"}, status=400, headers=cors_headers)
+    user = None
+    uid = 0
 
-    user = verify_telegram_init_data(init_data, BOT_TOKEN or "")
-    if not user:
-        # En desarrollo permitimos user_id directo para pruebas
+    if init_data:
+        user = verify_telegram_init_data(init_data, BOT_TOKEN or "")
+        if user:
+            uid = user.get("id", 0)
+
+    # Fallback: user_id directo (para desarrollo y cuando initData no está disponible)
+    if uid == 0:
         try:
             uid = int(request.rel_url.query.get("user_id", "0"))
-            if uid == 0:
-                return web.json_response({"error": "unauthorized"}, status=401, headers=cors_headers)
         except ValueError:
-            return web.json_response({"error": "unauthorized"}, status=401, headers=cors_headers)
-    else:
-        uid = user.get("id", 0)
+            uid = 0
+
+    if uid == 0:
+        return web.json_response({"error": "missing initData"}, status=400, headers=cors_headers)
 
     sub = await db.get_subscription(uid)
     if not sub:
