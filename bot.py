@@ -1,566 +1,1723 @@
 """
-database.py — VIP Bot · Capa de datos async (SQLite + WAL)
-Versión final con todas las funciones necesarias.
+bot.py — VIP Bot · Versión final con panel admin mejorado (expulsar miembro, resetear datos)
+Flujo amigable, jobs automáticos, API endpoints.
 """
 
-import asyncio
-import csv
+import hashlib
+import hmac
 import io
+import json
+import logging
 import os
-import sqlite3
-from datetime import datetime, timezone
-from typing import Optional
+import random
+import secrets
+import string
+import asyncio
+import xml.etree.ElementTree as ET
+import aiohttp
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import parse_qsl, unquote
 
-DB_DIR  = os.getenv("DB_DIR", ".")
-DB_PATH = os.path.join(DB_DIR, "vip_bot.db")
+from aiohttp import web
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ConversationHandler, ContextTypes,
+    filters, JobQueue
+)
 
+import database as db
+import keyboards as kb
+import messages as msg
 
 # ──────────────────────────────────────────────────────────────
-# CONEXIÓN
+# CONFIGURACIÓN
 # ──────────────────────────────────────────────────────────────
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-async def init_db():
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _init_db_sync)
+BOT_TOKEN       = os.getenv("BOT_TOKEN")
+ADMIN_ID        = int(os.getenv("ADMIN_ID", "0"))
+CHANNEL_ID      = int(os.getenv("CHANNEL_ID", "-1003738953503"))
+FREE_TRIAL_DAYS = 30
+API_PORT        = int(os.getenv("PORT", os.getenv("API_PORT", "8080")))
 
-def _init_db_sync():
-    with get_conn() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id     INTEGER PRIMARY KEY,
-            username    TEXT,
-            first_name  TEXT,
-            added_by    INTEGER,
-            added_at    TEXT DEFAULT (datetime('now'))
-        );
+# ──────────────────────────────────────────────────────────────
+# CACHÉ EN MEMORIA
+# ──────────────────────────────────────────────────────────────
+_news_cache: dict = {"items": [], "fetched_at": None}
+_calendar_cache: dict = {"events": [], "fetched_at": None}
+_alerted_events: set = set()
+_seen_news_links: set = set()
 
-        CREATE TABLE IF NOT EXISTS codes (
-            code        TEXT PRIMARY KEY,
-            days        INTEGER NOT NULL,
-            max_uses    INTEGER NOT NULL,
-            used_count  INTEGER DEFAULT 0,
-            note        TEXT,
-            expires_at  TEXT,
-            created_at  TEXT DEFAULT (datetime('now')),
-            created_by  INTEGER,
-            is_active   INTEGER DEFAULT 1
-        );
+NEWS_CACHE_SECONDS     = 600    # 10 minutos
+CALENDAR_CACHE_SECONDS = 1800   # 30 minutos
 
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            user_id     INTEGER PRIMARY KEY,
-            username    TEXT,
-            first_name  TEXT,
-            expiry      TEXT NOT NULL,
-            total_days  INTEGER DEFAULT 0,
-            renewals    INTEGER DEFAULT 0,
-            last_code   TEXT,
-            joined_at   TEXT DEFAULT (datetime('now'))
-        );
+# ──────────────────────────────────────────────────────────────
+# FUENTES RSS
+# ──────────────────────────────────────────────────────────────
+RSS_SOURCES = [
+    ("🇪🇸 Cointelegraph ES",  "https://es.cointelegraph.com/rss",                    "es"),
+    ("🇪🇸 BeInCrypto ES",     "https://es.beincrypto.com/feed/",                     "es"),
+    ("🇪🇸 CriptoNoticias",    "https://www.criptonoticias.com/feed/",                 "es"),
+    ("🇺🇸 Cointelegraph EN",  "https://cointelegraph.com/rss",                       "en"),
+    ("🇺🇸 CoinDesk",          "https://www.coindesk.com/arc/outboundfeeds/rss/",     "en"),
+    ("🇺🇸 Decrypt",           "https://decrypt.co/feed",                             "en"),
+    ("🇺🇸 ForexLive",         "https://www.forexlive.com/feed/news",                 "en"),
+]
 
-        CREATE TABLE IF NOT EXISTS blacklist (
-            user_id     INTEGER PRIMARY KEY,
-            reason      TEXT,
-            banned_at   TEXT DEFAULT (datetime('now')),
-            banned_by   INTEGER
-        );
+# ──────────────────────────────────────────────────────────────
+# CORS HEADERS
+# ──────────────────────────────────────────────────────────────
+CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
 
-        CREATE TABLE IF NOT EXISTS free_trials (
-            user_id     INTEGER PRIMARY KEY,
-            used_at     TEXT DEFAULT (datetime('now'))
-        );
+# ──────────────────────────────────────────────────────────────
+# VERIFICACIÓN TELEGRAM
+# ──────────────────────────────────────────────────────────────
+def verify_telegram_init_data(init_data: str, bot_token: str) -> dict | None:
+    try:
+        params = dict(parse_qsl(init_data, keep_blank_values=True))
+        hash_val = params.pop("hash", "")
+        data_check = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
+        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+        computed = hmac.new(secret_key, data_check.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(computed, hash_val):
+            return None
+        user_str = params.get("user", "{}")
+        return json.loads(unquote(user_str))
+    except Exception:
+        return None
 
-        CREATE TABLE IF NOT EXISTS stats (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            event       TEXT NOT NULL,
-            user_id     INTEGER,
-            data        TEXT,
-            created_at  TEXT DEFAULT (datetime('now'))
-        );
+# ──────────────────────────────────────────────────────────────
+# API ENDPOINTS
+# ──────────────────────────────────────────────────────────────
+async def api_user_info(request: web.Request) -> web.Response:
+    """Endpoint para la Mini App - verifica membresía"""
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=CORS)
 
-        CREATE TABLE IF NOT EXISTS audit_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id    INTEGER NOT NULL,
-            action      TEXT NOT NULL,
-            target      TEXT,
-            detail      TEXT,
-            created_at  TEXT DEFAULT (datetime('now'))
-        );
+    # Intentar obtener user_id
+    uid = 0
+    try:
+        uid = int(request.rel_url.query.get("user_id", "0"))
+    except ValueError:
+        pass
 
-        CREATE TABLE IF NOT EXISTS broadcast_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            message     TEXT NOT NULL,
-            filter_type TEXT DEFAULT 'all',
-            sent_to     INTEGER DEFAULT 0,
-            failed      INTEGER DEFAULT 0,
-            created_at  TEXT DEFAULT (datetime('now'))
-        );
+    if uid == 0:
+        init_data = request.rel_url.query.get("initData", "")
+        if init_data:
+            try:
+                params = dict(parse_qsl(init_data, keep_blank_values=True))
+                user_raw = json.loads(unquote(params.get("user", "{}")))
+                uid = user_raw.get("id", 0)
+            except Exception:
+                pass
 
-        CREATE TABLE IF NOT EXISTS support_tickets (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER NOT NULL,
-            username    TEXT,
-            first_name  TEXT,
-            subject     TEXT,
-            status      TEXT DEFAULT 'open',
-            created_at  TEXT DEFAULT (datetime('now')),
-            updated_at  TEXT DEFAULT (datetime('now')),
-            closed_at   TEXT
-        );
+    if uid == 0:
+        return web.json_response({"error": "missing user_id"}, status=400, headers=CORS)
 
-        CREATE TABLE IF NOT EXISTS ticket_messages (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticket_id   INTEGER NOT NULL REFERENCES support_tickets(id),
-            sender_id   INTEGER NOT NULL,
-            is_admin    INTEGER DEFAULT 0,
-            message     TEXT NOT NULL,
-            sent_at     TEXT DEFAULT (datetime('now'))
-        );
-        """)
+    sub = await db.get_subscription(uid)
+    if not sub:
+        return web.json_response({
+            "has_membership": False,
+            "user_id": uid,
+        }, headers=CORS)
+
+    expiry_dt = datetime.strptime(sub["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    now_dt = datetime.now(timezone.utc)
+    seconds_left = max(0, int((expiry_dt - now_dt).total_seconds()))
+
+    return web.json_response({
+        "has_membership": True,
+        "user_id": uid,
+        "first_name": sub["first_name"] or "",
+        "username": sub["username"] or "",
+        "expiry": sub["expiry"],
+        "seconds_left": seconds_left,
+        "total_days": sub["total_days"] or 0,
+        "is_expired": now_dt > expiry_dt,
+    }, headers=CORS)
+
+async def api_news(request: web.Request) -> web.Response:
+    """Endpoint de noticias para la Mini App"""
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=CORS)
+
+    items = await refresh_news_cache()
+    now = datetime.now(timezone.utc).timestamp()
+
+    if not items:
+        return web.json_response({"error": "no_data", "items": []}, status=503, headers=CORS)
+
+    return web.json_response({
+        "items": items[:20],
+        "cached": True,
+        "fetched_at": _news_cache["fetched_at"],
+        "total": len(items),
+    }, headers=CORS)
+
+async def api_calendar(request: web.Request) -> web.Response:
+    """Endpoint de calendario económico"""
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=CORS)
+
+    now = datetime.now(timezone.utc).timestamp()
+    cached = _calendar_cache
+
+    if cached["fetched_at"] and (now - cached["fetched_at"]) < CALENDAR_CACHE_SECONDS:
+        return web.json_response({
+            "events": cached["events"],
+            "cached": True,
+        }, headers=CORS)
+
+    try:
+        cal_url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(cal_url) as resp:
+                events = await resp.json(content_type=None)
+
+        _calendar_cache["events"] = events
+        _calendar_cache["fetched_at"] = now
+
+        return web.json_response({"events": events}, headers=CORS)
+
+    except Exception as e:
+        logger.warning(f"api_calendar error: {e}")
+        if cached["events"]:
+            return web.json_response({"events": cached["events"], "cached": True}, headers=CORS)
+        return web.json_response({"error": "no_data", "events": []}, status=503, headers=CORS)
+
+# ──────────────────────────────────────────────────────────────
+# RSS HELPERS
+# ──────────────────────────────────────────────────────────────
+async def fetch_rss_items(session: aiohttp.ClientSession, name: str, url: str, max_items: int = 5) -> list[dict]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; VIPBot/2.0; +https://t.me/bot)",
+        "Accept": "application/rss+xml, application/xml, text/xml, */*",
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return []
+            raw = await resp.read()
+
+        root = ET.fromstring(raw)
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        items = []
+
+        # RSS 2.0
+        for item in root.findall(".//item")[:max_items]:
+            title = item.findtext("title", "").strip()
+            link = item.findtext("link", "").strip()
+            date = item.findtext("pubDate", "").strip()
+            if title and link:
+                items.append({"title": title, "link": link, "pubDate": date, "source": name})
+
+        # Atom
+        if not items:
+            for entry in root.findall(".//atom:entry", ns)[:max_items]:
+                title = entry.findtext("atom:title", "", ns).strip()
+                link_el = entry.find("atom:link", ns)
+                link = link_el.get("href", "") if link_el is not None else ""
+                date = entry.findtext("atom:updated", "", ns).strip()
+                if title and link:
+                    items.append({"title": title, "link": link, "pubDate": date, "source": name})
+
+        return items
+    except Exception:
+        return []
+
+async def refresh_news_cache() -> list[dict]:
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    if _news_cache["fetched_at"] and (now_ts - _news_cache["fetched_at"]) < NEWS_CACHE_SECONDS:
+        return _news_cache["items"]
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_rss_items(session, name, url) for name, url, _ in RSS_SOURCES]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_items = []
+    for res in results:
+        if isinstance(res, list):
+            all_items.extend(res)
+
+    if all_items:
+        _news_cache["items"] = all_items
+        _news_cache["fetched_at"] = now_ts
+
+    return _news_cache["items"]
+
+# ──────────────────────────────────────────────────────────────
+# SERVIDOR HTTP
+# ──────────────────────────────────────────────────────────────
+async def start_api_server():
+    app_http = web.Application()
+    app_http.router.add_route("GET", "/api/user_info", api_user_info)
+    app_http.router.add_route("OPTIONS", "/api/user_info", api_user_info)
+    app_http.router.add_route("GET", "/api/news", api_news)
+    app_http.router.add_route("OPTIONS", "/api/news", api_news)
+    app_http.router.add_route("GET", "/api/calendar", api_calendar)
+    app_http.router.add_route("OPTIONS", "/api/calendar", api_calendar)
+
+    runner = web.AppRunner(app_http)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", API_PORT)
+    await site.start()
+    logger.info(f"🌐 API en puerto {API_PORT}")
+
+# ──────────────────────────────────────────────────────────────
+# ESTADOS DE CONVERSACIÓN (ACTUALIZADOS)
+# ──────────────────────────────────────────────────────────────
+(
+    STATE_ACTIVATE,
+    STATE_RENEW,
+    STATE_GEN_CODE,
+    STATE_BAN_INPUT,
+    STATE_UNBAN_INPUT,
+    STATE_BROADCAST_MSG,
+    STATE_TICKET_SUBJECT,
+    STATE_TICKET_MESSAGE,
+    STATE_TICKET_REPLY_USER,
+    STATE_ADM_TICKET_REPLY,
+    STATE_ADD_ADMIN,
+    STATE_REMOVE_ADMIN,
+    STATE_ADDDAYS_INPUT,
+    STATE_KICK_MEMBER,
+    STATE_RESET_CONFIRM,
+) = range(15)
+
+BROADCAST_FILTER = {}
 
 # ──────────────────────────────────────────────────────────────
 # HELPERS
 # ──────────────────────────────────────────────────────────────
-def now_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
-async def run(fn, *args):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, fn, *args)
+def fmt_expiry(dt: datetime) -> str:
+    return dt.strftime("%d/%m/%Y %H:%M UTC")
 
+def days_left(expiry_str: str) -> int:
+    exp = datetime.strptime(expiry_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    return max(0, (exp - utc_now()).days)
 
-# ──────────────────────────────────────────────────────────────
-# ADMINS
-# ──────────────────────────────────────────────────────────────
-async def get_all_admin_ids() -> list[int]:
-    def _f():
-        with get_conn() as conn:
-            rows = conn.execute("SELECT user_id FROM admins").fetchall()
-            return [r["user_id"] for r in rows]
-    db_admins = await run(_f)
-    main_admin = int(os.getenv("ADMIN_ID", "0"))
-    if main_admin and main_admin not in db_admins:
-        db_admins.append(main_admin)
-    return db_admins
+async def is_admin(user_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    admin_ids = await db.get_all_admin_ids()
+    return user_id in admin_ids
 
-async def add_admin(user_id: int, username: str, first_name: str, added_by: int):
-    def _f(u, un, fn, ab):
-        with get_conn() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO admins (user_id,username,first_name,added_by) VALUES (?,?,?,?)",
-                (u, un, fn, ab)
-            )
-    await run(_f, user_id, username, first_name, added_by)
+async def kick_from_channel(bot, user_id: int):
+    """Expulsa usuario del canal (banea y desbanea para que pueda reingresar después)"""
+    try:
+        await bot.ban_chat_member(CHANNEL_ID, user_id)
+        await bot.unban_chat_member(CHANNEL_ID, user_id)
+        logger.info(f"👢 Expulsado {user_id} del canal")
+    except TelegramError as e:
+        logger.warning(f"Error expulsando {user_id}: {e}")
 
-async def remove_admin(user_id: int):
-    def _f(u):
-        with get_conn() as conn:
-            conn.execute("DELETE FROM admins WHERE user_id=?", (u,))
-    await run(_f, user_id)
+async def add_to_channel(bot, user_id: int) -> str | None:
+    """Genera link de invitación al canal"""
+    try:
+        link = await bot.create_chat_invite_link(
+            CHANNEL_ID,
+            member_limit=1,
+            expire_date=utc_now() + timedelta(minutes=5)
+        )
+        return link.invite_link
+    except TelegramError as e:
+        logger.warning(f"Error creando link para {user_id}: {e}")
+        return None
 
-async def list_admins() -> list:
-    def _f():
-        with get_conn() as conn:
-            return conn.execute("SELECT * FROM admins ORDER BY added_at ASC").fetchall()
-    return await run(_f)
+async def notify_user(bot, user_id: int, text: str, **kwargs):
+    try:
+        await bot.send_message(user_id, text, **kwargs)
+    except TelegramError as e:
+        logger.warning(f"Error notificando {user_id}: {e}")
 
-
-# ──────────────────────────────────────────────────────────────
-# CODES
-# ──────────────────────────────────────────────────────────────
-async def code_exists(code: str) -> bool:
-    def _f(c):
-        with get_conn() as conn:
-            return conn.execute("SELECT 1 FROM codes WHERE code=?", (c,)).fetchone() is not None
-    return await run(_f, code)
-
-async def create_code(code: str, days: int, max_uses: int, note: str = "",
-                      expires_at: str = None, created_by: int = None):
-    def _f(c, d, m, n, e, cb):
-        with get_conn() as conn:
-            conn.execute(
-                "INSERT INTO codes (code,days,max_uses,note,expires_at,created_by) VALUES (?,?,?,?,?,?)",
-                (c, d, m, n, e, cb)
-            )
-    await run(_f, code, days, max_uses, note, expires_at, created_by)
-
-async def get_code(code: str) -> Optional[sqlite3.Row]:
-    def _f(c):
-        with get_conn() as conn:
-            row = conn.execute("SELECT * FROM codes WHERE code=? AND is_active=1", (c,)).fetchone()
-            if not row:
-                return None
-            if row["expires_at"]:
-                exp = datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-                if datetime.now(timezone.utc) > exp:
-                    return None
-            return row
-    return await run(_f, code)
-
-async def use_code(code: str):
-    def _f(c):
-        with get_conn() as conn:
-            conn.execute("UPDATE codes SET used_count=used_count+1 WHERE code=?", (c,))
-    await run(_f, code)
-
-async def deactivate_code(code: str):
-    def _f(c):
-        with get_conn() as conn:
-            conn.execute("UPDATE codes SET is_active=0 WHERE code=?", (c,))
-    await run(_f, code)
-
-async def list_codes(active_only: bool = False) -> list:
-    def _f(ao):
-        with get_conn() as conn:
-            q = "SELECT * FROM codes"
-            if ao:
-                q += " WHERE is_active=1"
-            q += " ORDER BY created_at DESC"
-            return conn.execute(q).fetchall()
-    return await run(_f, active_only)
-
-async def get_active_codes() -> list:
-    """Retorna todos los códigos activos no expirados"""
-    def _f():
-        with get_conn() as conn:
-            return conn.execute(
-                "SELECT * FROM codes WHERE is_active=1 AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY created_at DESC"
-            ).fetchall()
-    return await run(_f)
-
-async def delete_code(code: str):
-    def _f(c):
-        with get_conn() as conn:
-            conn.execute("DELETE FROM codes WHERE code=?", (c,))
-    await run(_f, code)
-
+async def unique_code() -> str:
+    chars = string.ascii_uppercase + string.digits
+    for _ in range(50):
+        code = "VIP-" + "".join(random.choices(chars, k=6))
+        if not await db.code_exists(code):
+            return code
+    return "VIP-" + secrets.token_hex(4).upper()
 
 # ──────────────────────────────────────────────────────────────
-# SUBSCRIPTIONS
+# CHECK BANEADOS
 # ──────────────────────────────────────────────────────────────
-async def get_subscription(user_id: int) -> Optional[sqlite3.Row]:
-    def _f(u):
-        with get_conn() as conn:
-            return conn.execute("SELECT * FROM subscriptions WHERE user_id=?", (u,)).fetchone()
-    return await run(_f, user_id)
-
-async def upsert_subscription(user_id: int, username: str, first_name: str,
-                               expiry: str, total_days: int, last_code: str):
-    def _f(u, un, fn, ex, td, lc):
-        with get_conn() as conn:
-            conn.execute("""
-                INSERT INTO subscriptions (user_id,username,first_name,expiry,total_days,renewals,last_code)
-                VALUES (?,?,?,?,?,0,?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    username=excluded.username,
-                    first_name=excluded.first_name,
-                    expiry=excluded.expiry,
-                    total_days=total_days+excluded.total_days,
-                    renewals=renewals+1,
-                    last_code=excluded.last_code
-            """, (u, un, fn, ex, td, lc))
-    await run(_f, user_id, username, first_name, expiry, total_days, last_code)
-
-async def delete_subscription(user_id: int):
-    def _f(u):
-        with get_conn() as conn:
-            conn.execute("DELETE FROM subscriptions WHERE user_id=?", (u,))
-    await run(_f, user_id)
-
-async def add_days_to_subscription(user_id: int, days: int) -> bool:
-    def _f(u, d):
-        with get_conn() as conn:
-            row = conn.execute("SELECT expiry FROM subscriptions WHERE user_id=?", (u,)).fetchone()
-            if not row:
-                return False
-            from datetime import timedelta
-            current = datetime.strptime(row["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            new_exp = max(current, datetime.now(timezone.utc)) + timedelta(days=d)
-            conn.execute(
-                "UPDATE subscriptions SET expiry=?, total_days=total_days+? WHERE user_id=?",
-                (new_exp.strftime("%Y-%m-%d %H:%M:%S"), d, u)
-            )
-            return True
-    return await run(_f, user_id, days)
-
-async def get_all_subscriptions() -> list:
-    def _f():
-        with get_conn() as conn:
-            return conn.execute("SELECT * FROM subscriptions ORDER BY expiry DESC").fetchall()
-    return await run(_f)
-
-async def get_active_members() -> list:
-    def _f():
-        with get_conn() as conn:
-            return conn.execute(
-                "SELECT * FROM subscriptions WHERE expiry > datetime('now') ORDER BY expiry ASC"
-            ).fetchall()
-    return await run(_f)
-
-async def get_expired_members() -> list:
-    def _f():
-        with get_conn() as conn:
-            return conn.execute(
-                "SELECT * FROM subscriptions WHERE expiry <= datetime('now')"
-            ).fetchall()
-    return await run(_f)
-
-async def get_expiring_soon(hours: int) -> list:
-    def _f(h):
-        with get_conn() as conn:
-            return conn.execute(
-                "SELECT * FROM subscriptions WHERE expiry > datetime('now') "
-                "AND expiry <= datetime('now', ? || ' hours')", (str(h),)
-            ).fetchall()
-    return await run(_f, hours)
-
-async def get_members_by_days_range(min_days: int, max_days: int) -> list:
-    def _f(mn, mx):
-        with get_conn() as conn:
-            return conn.execute(
-                "SELECT * FROM subscriptions WHERE expiry > datetime('now') "
-                "AND CAST((julianday(expiry) - julianday('now')) AS INTEGER) BETWEEN ? AND ?",
-                (mn, mx)
-            ).fetchall()
-    return await run(_f, min_days, max_days)
-
-async def export_members_csv() -> str:
-    def _f():
-        with get_conn() as conn:
-            rows = conn.execute(
-                "SELECT user_id, username, first_name, expiry, total_days, renewals, last_code, joined_at "
-                "FROM subscriptions ORDER BY joined_at DESC"
-            ).fetchall()
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["user_id", "username", "first_name", "expiry", "total_days", "renewals", "last_code", "joined_at"])
-        for row in rows:
-            writer.writerow([row["user_id"], row["username"] or "", row["first_name"] or "",
-                             row["expiry"], row["total_days"], row["renewals"],
-                             row["last_code"] or "", row["joined_at"]])
-        return output.getvalue()
-    return await run(_f)
-
+async def check_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    if await db.is_banned(user.id):
+        target = update.message or (update.callback_query and update.callback_query.message)
+        if target:
+            try:
+                await target.reply_text(msg.already_banned())
+            except TelegramError:
+                pass
+        return True
+    return False
 
 # ──────────────────────────────────────────────────────────────
-# BLACKLIST
+# MENÚ PRINCIPAL - CALLBACK (FALTABA)
 # ──────────────────────────────────────────────────────────────
-async def is_banned(user_id: int) -> bool:
-    def _f(u):
-        with get_conn() as conn:
-            return conn.execute("SELECT 1 FROM blacklist WHERE user_id=?", (u,)).fetchone() is not None
-    return await run(_f, user_id)
-
-async def ban_user(user_id: int, reason: str, banned_by: int):
-    def _f(u, r, b):
-        with get_conn() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO blacklist (user_id,reason,banned_by) VALUES (?,?,?)",
-                (u, r, b)
-            )
-    await run(_f, user_id, reason, banned_by)
-
-async def unban_user(user_id: int):
-    def _f(u):
-        with get_conn() as conn:
-            conn.execute("DELETE FROM blacklist WHERE user_id=?", (u,))
-    await run(_f, user_id)
-
-async def get_blacklist() -> list:
-    def _f():
-        with get_conn() as conn:
-            return conn.execute("SELECT * FROM blacklist ORDER BY banned_at DESC").fetchall()
-    return await run(_f)
-
+async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Regresa al menú principal"""
+    if await check_banned(update, context):
+        return
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    await q.edit_message_text(
+        f"✨ *Hola {user.first_name}*\n\n"
+        f"Selecciona una opción del menú:",
+        reply_markup=kb.main_menu(),
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 # ──────────────────────────────────────────────────────────────
-# FREE TRIALS
+# HANDLER PRINCIPAL - START
 # ──────────────────────────────────────────────────────────────
-async def has_used_trial(user_id: int) -> bool:
-    def _f(u):
-        with get_conn() as conn:
-            return conn.execute("SELECT 1 FROM free_trials WHERE user_id=?", (u,)).fetchone() is not None
-    return await run(_f, user_id)
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mensaje de bienvenida cálido que dice el nombre del usuario"""
+    if await check_banned(update, context):
+        return
 
-async def mark_trial_used(user_id: int):
-    def _f(u):
-        with get_conn() as conn:
-            conn.execute("INSERT OR IGNORE INTO free_trials (user_id) VALUES (?)", (u,))
-    await run(_f, user_id)
+    user = update.effective_user
 
+    # Verificar si ya tiene membresía activa
+    sub = await db.get_subscription(user.id)
+    if sub and days_left(sub["expiry"]) > 0:
+        # Ya es miembro, mostrar menú completo
+        await update.message.reply_text(
+            f"✨ *¡Hola de nuevo, {user.first_name}!*\n\n"
+            f"Tu membresía sigue activa. ¿Qué necesitas hacer hoy?",
+            reply_markup=kb.main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
 
-# ──────────────────────────────────────────────────────────────
-# STATS & AUDIT
-# ──────────────────────────────────────────────────────────────
-async def log_event(event: str, user_id: int = None, data: str = ""):
-    def _f(e, u, d):
-        with get_conn() as conn:
-            conn.execute("INSERT INTO stats (event,user_id,data) VALUES (?,?,?)", (e, u, d))
-    await run(_f, event, user_id, data)
+    # Mensaje de bienvenida para nuevos usuarios
+    welcome_text = (
+        f"👋 *¡Hola {user.first_name}! Bienvenido al bot VIP*\n\n"
+        f"Para acceder al canal exclusivo de copy trading, necesitas un código de activación.\n\n"
+        f"🔑 *¿Tienes un código?*\n"
+        f"Si ya tienes un código proporcionado por soporte, simplemente *pégalo aquí* y te daré acceso inmediato.\n\n"
+        f"❓ *¿No tienes código?*\n"
+        f"Contacta con el administrador para adquirir tu membresía.\n\n"
+        f"✏️ *Escribe tu código VIP aquí* o usa el botón de abajo:"
+    )
 
-async def get_stats_summary() -> dict:
-    def _f():
-        with get_conn() as conn:
-            total    = conn.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0]
-            active   = conn.execute("SELECT COUNT(*) FROM subscriptions WHERE expiry > datetime('now')").fetchone()[0]
-            codes_   = conn.execute("SELECT COUNT(*) FROM codes WHERE is_active=1").fetchone()[0]
-            banned   = conn.execute("SELECT COUNT(*) FROM blacklist").fetchone()[0]
-            trials   = conn.execute("SELECT COUNT(*) FROM free_trials").fetchone()[0]
-            new_today= conn.execute("SELECT COUNT(*) FROM subscriptions WHERE date(joined_at)=date('now')").fetchone()[0]
-            tickets_open = conn.execute("SELECT COUNT(*) FROM support_tickets WHERE status='open'").fetchone()[0]
-            expiring_3d  = conn.execute(
-                "SELECT COUNT(*) FROM subscriptions WHERE expiry > datetime('now') "
-                "AND expiry <= datetime('now', '3 days')"
-            ).fetchone()[0]
-            admins_count = conn.execute("SELECT COUNT(*) FROM admins").fetchone()[0]
-            return {
-                "total": total, "active": active, "codes": codes_,
-                "banned": banned, "trials": trials, "new_today": new_today,
-                "tickets_open": tickets_open, "expiring_3d": expiring_3d,
-                "admins": admins_count + 1
-            }
-    return await run(_f)
+    keyboard = [[InlineKeyboardButton("🔑 Pegar mi código", callback_data="activate")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-async def get_user_history(user_id: int) -> list:
-    def _f(u):
-        with get_conn() as conn:
-            return conn.execute(
-                "SELECT * FROM stats WHERE user_id=? ORDER BY created_at DESC LIMIT 30", (u,)
-            ).fetchall()
-    return await run(_f, user_id)
-
-async def audit(admin_id: int, action: str, target: str = "", detail: str = ""):
-    def _f(a, ac, t, d):
-        with get_conn() as conn:
-            conn.execute(
-                "INSERT INTO audit_log (admin_id,action,target,detail) VALUES (?,?,?,?)",
-                (a, ac, t, d)
-            )
-    await run(_f, admin_id, action, target, detail)
-
-async def get_audit_log(limit: int = 50) -> list:
-    def _f(l):
-        with get_conn() as conn:
-            return conn.execute(
-                "SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?", (l,)
-            ).fetchall()
-    return await run(_f, limit)
-
+    await update.message.reply_text(
+        welcome_text,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 # ──────────────────────────────────────────────────────────────
-# BROADCAST LOG
+# ACTIVAR CÓDIGO
 # ──────────────────────────────────────────────────────────────
-async def log_broadcast(message: str, filter_type: str, sent_to: int, failed: int):
-    def _f(m, ft, s, f):
-        with get_conn() as conn:
-            conn.execute(
-                "INSERT INTO broadcast_log (message,filter_type,sent_to,failed) VALUES (?,?,?,?)",
-                (m, ft, s, f)
-            )
-    await run(_f, message, filter_type, sent_to, failed)
+async def activate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_banned(update, context):
+        return ConversationHandler.END
 
-async def get_broadcast_history(limit: int = 10) -> list:
-    def _f(l):
-        with get_conn() as conn:
-            return conn.execute(
-                "SELECT * FROM broadcast_log ORDER BY created_at DESC LIMIT ?", (l,)
-            ).fetchall()
-    return await run(_f, limit)
+    if update.callback_query:
+        q = update.callback_query
+        await q.answer()
+        await q.edit_message_text(
+            "🔑 *Activar código VIP*\n\n"
+            "Por favor, escribe el código que te proporcionó soporte.\n\n"
+            "✏️ *Ejemplo:* `VIP-ABC123`\n\n"
+            "_El código es sensible a mayúsculas, escríbelo exactamente como te lo dieron._",
+            reply_markup=kb.cancel_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await update.message.reply_text(
+            "🔑 *Perfecto, dime tu código VIP:*\n\n"
+            "Escríbelo exactamente como te lo dio soporte.",
+            reply_markup=kb.cancel_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
 
+    return STATE_ACTIVATE
+
+async def activate_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_banned(update, context):
+        return ConversationHandler.END
+
+    user = update.effective_user
+    code = update.message.text.strip().upper()
+
+    await update.message.chat.send_action(action="typing")
+    await asyncio.sleep(0.5)
+
+    try:
+        row = await db.get_code(code)
+    except Exception as e:
+        logger.error(f"Error DB: {e}")
+        await update.message.reply_text(
+            "❌ *Error interno*\n\n"
+            "Hubo un problema al verificar el código. Por favor, intenta de nuevo en unos segundos.",
+            reply_markup=kb.main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return ConversationHandler.END
+
+    if not row or row["used_count"] >= row["max_uses"]:
+        await update.message.reply_text(
+            "❌ *Código inválido*\n\n"
+            "El código que ingresaste no existe, ya fue usado o está desactivado.\n\n"
+            "🔍 Verifica que lo escribiste correctamente o contacta a soporte.",
+            reply_markup=kb.main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return ConversationHandler.END
+
+    days = row["days"]
+    sub = await db.get_subscription(user.id)
+    if sub:
+        current_exp = datetime.strptime(sub["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        new_exp = max(current_exp, utc_now()) + timedelta(days=days)
+    else:
+        new_exp = utc_now() + timedelta(days=days)
+
+    exp_str = new_exp.strftime("%Y-%m-%d %H:%M:%S")
+    await db.upsert_subscription(user.id, user.username or "", user.first_name, exp_str, days, code)
+    await db.use_code(code)
+
+    if row["used_count"] + 1 >= row["max_uses"]:
+        await db.deactivate_code(code)
+
+    await update.message.chat.send_action(action="typing")
+    await asyncio.sleep(0.5)
+
+    link = await add_to_channel(context.bot, user.id)
+
+    success_text = (
+        f"✅ *¡Felicidades {user.first_name}!*\n\n"
+        f"Tu código *{code}* ha sido activado correctamente.\n\n"
+        f"📅 *Días agregados:* {days}\n"
+        f"⏳ *Válido hasta:* {fmt_expiry(new_exp)}\n\n"
+    )
+
+    if link:
+        success_text += (
+            f"🔗 *Accede al canal VIP aquí:*\n"
+            f"{link}\n\n"
+            f"_El link es de un solo uso y expira en 5 minutos._"
+        )
+    else:
+        success_text += (
+            f"⚠️ *No pude generar el link automáticamente.*\n"
+            f"Por favor, contacta a soporte para que te agreguen al canal."
+        )
+
+    success_text += f"\n\n✨ Ya puedes usar todas las funciones del bot y la calculadora VIP."
+
+    await update.message.reply_text(
+        success_text,
+        reply_markup=kb.main_menu(),
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True
+    )
+
+    await db.log_event("activate", user.id, f"code={code} days={days}")
+    logger.info(f"✅ Usuario {user.id} activó {code} (+{days} días)")
+
+    return ConversationHandler.END
 
 # ──────────────────────────────────────────────────────────────
-# SUPPORT TICKETS
+# RENOVAR CÓDIGO
 # ──────────────────────────────────────────────────────────────
-async def create_ticket(user_id: int, username: str, first_name: str, subject: str) -> int:
-    def _f(u, un, fn, s):
-        with get_conn() as conn:
-            cur = conn.execute(
-                "INSERT INTO support_tickets (user_id,username,first_name,subject) VALUES (?,?,?,?)",
-                (u, un, fn, s)
-            )
-            return cur.lastrowid
-    return await run(_f, user_id, username, first_name, subject)
+async def renew_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_banned(update, context):
+        return ConversationHandler.END
 
-async def get_ticket(ticket_id: int) -> Optional[sqlite3.Row]:
-    def _f(t):
-        with get_conn() as conn:
-            return conn.execute("SELECT * FROM support_tickets WHERE id=?", (t,)).fetchone()
-    return await run(_f, ticket_id)
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🔄 *Renovar acceso*\n\n"
+        "¿Tienes un código de renovación? Escríbelo aquí y sumaré días a tu membresía actual.\n\n"
+        "✏️ *Escribe tu código:*",
+        reply_markup=kb.cancel_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return STATE_RENEW
 
-async def get_user_tickets(user_id: int) -> list:
-    def _f(u):
-        with get_conn() as conn:
-            return conn.execute(
-                "SELECT * FROM support_tickets WHERE user_id=? ORDER BY created_at DESC", (u,)
-            ).fetchall()
-    return await run(_f, user_id)
+async def renew_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    code = update.message.text.strip().upper()
 
-async def get_open_tickets() -> list:
-    def _f():
-        with get_conn() as conn:
-            return conn.execute(
-                "SELECT * FROM support_tickets WHERE status='open' ORDER BY created_at ASC"
-            ).fetchall()
-    return await run(_f)
+    row = await db.get_code(code)
 
-async def get_all_tickets(limit: int = 30) -> list:
-    def _f(l):
-        with get_conn() as conn:
-            return conn.execute(
-                "SELECT * FROM support_tickets ORDER BY updated_at DESC LIMIT ?", (l,)
-            ).fetchall()
-    return await run(_f, limit)
+    if not row or row["used_count"] >= row["max_uses"]:
+        await update.message.reply_text(
+            "❌ *Código inválido*\n\n"
+            "El código no existe o ya fue usado.",
+            reply_markup=kb.main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return ConversationHandler.END
 
-async def add_ticket_message(ticket_id: int, sender_id: int, message: str, is_admin: bool = False):
-    def _f(t, s, m, a):
-        with get_conn() as conn:
-            conn.execute(
-                "INSERT INTO ticket_messages (ticket_id,sender_id,message,is_admin) VALUES (?,?,?,?)",
-                (t, s, m, int(a))
-            )
-            conn.execute(
-                "UPDATE support_tickets SET updated_at=datetime('now') WHERE id=?", (t,)
-            )
-    await run(_f, ticket_id, sender_id, message, is_admin)
+    sub = await db.get_subscription(user.id)
+    if not sub:
+        await update.message.reply_text(
+            "⚠️ *No tienes membresía activa*\n\n"
+            "Usa la opción *Activar código* primero para obtener tu primer acceso.",
+            reply_markup=kb.main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return ConversationHandler.END
 
-async def get_ticket_messages(ticket_id: int) -> list:
-    def _f(t):
-        with get_conn() as conn:
-            return conn.execute(
-                "SELECT * FROM ticket_messages WHERE ticket_id=? ORDER BY sent_at ASC", (t,)
-            ).fetchall()
-    return await run(_f, ticket_id)
+    days = row["days"]
+    current_exp = datetime.strptime(sub["expiry"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    new_exp = max(current_exp, utc_now()) + timedelta(days=days)
+    exp_str = new_exp.strftime("%Y-%m-%d %H:%M:%S")
 
-async def close_ticket(ticket_id: int):
-    def _f(t):
-        with get_conn() as conn:
-            conn.execute(
-                "UPDATE support_tickets SET status='closed', closed_at=datetime('now') WHERE id=?", (t,)
-            )
-    await run(_f, ticket_id)
+    await db.upsert_subscription(user.id, user.username or "", user.first_name, exp_str, days, code)
+    await db.use_code(code)
 
-async def reopen_ticket(ticket_id: int):
-    def _f(t):
-        with get_conn() as conn:
-            conn.execute(
-                "UPDATE support_tickets SET status='open', closed_at=NULL WHERE id=?", (t,)
-            )
-    await run(_f, ticket_id)
+    if row["used_count"] + 1 >= row["max_uses"]:
+        await db.deactivate_code(code)
 
+    await update.message.reply_text(
+        f"✅ *¡Renovación exitosa!*\n\n"
+        f"Se agregaron *{days} días* a tu membresía.\n"
+        f"📅 Nueva fecha de vencimiento: `{fmt_expiry(new_exp)}`",
+        reply_markup=kb.main_menu(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    await db.log_event("renew", user.id, f"code={code} days={days}")
+    return ConversationHandler.END
 
 # ──────────────────────────────────────────────────────────────
-# RANKING
+# PRUEBA GRATIS
 # ──────────────────────────────────────────────────────────────
-async def get_ranking(limit: int = 10) -> list:
-    def _f(l):
-        with get_conn() as conn:
-            return conn.execute(
-                "SELECT user_id, username, first_name, total_days, joined_at "
-                "FROM subscriptions ORDER BY total_days DESC LIMIT ?", (l,)
-            ).fetchall()
-    return await run(_f, limit)
+async def free_trial_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_banned(update, context):
+        return
+
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+
+    if await db.has_used_trial(user.id):
+        await q.edit_message_text(
+            "⚠️ *Ya usaste tu prueba gratuita*\n\n"
+            "Cada usuario puede usar la prueba gratis solo una vez.\n"
+            "Adquiere un código VIP para continuar.",
+            reply_markup=kb.main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    new_exp = utc_now() + timedelta(days=FREE_TRIAL_DAYS)
+    exp_str = new_exp.strftime("%Y-%m-%d %H:%M:%S")
+
+    await db.upsert_subscription(user.id, user.username or "", user.first_name, exp_str, FREE_TRIAL_DAYS, "FREE_TRIAL")
+    await db.mark_trial_used(user.id)
+
+    link = await add_to_channel(context.bot, user.id)
+
+    reply_text = (
+        f"🎁 *¡Prueba gratuita activada!*\n\n"
+        f"Disfruta *{FREE_TRIAL_DAYS} días* de acceso VIP.\n"
+        f"📅 Vence: `{fmt_expiry(new_exp)}`\n\n"
+    )
+
+    if link:
+        reply_text += f"🔗 [Accede al canal aquí]({link})\n\n"
+
+    reply_text += "_La prueba es por única vez. Aprovecha al máximo el contenido._"
+
+    await q.edit_message_text(
+        reply_text,
+        reply_markup=kb.main_menu(),
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True
+    )
+
+    await db.log_event("trial", user.id, f"days={FREE_TRIAL_DAYS}")
+
+# ──────────────────────────────────────────────────────────────
+# HISTORIAL
+# ──────────────────────────────────────────────────────────────
+async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_banned(update, context):
+        return
+
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+
+    events = await db.get_user_history(user.id)
+
+    if not events:
+        await q.edit_message_text(
+            f"📜 *Historial de {user.first_name}*\n\n"
+            "_Aún no tienes actividad registrada._\n\n"
+            "Comienza activando un código o usando la prueba gratis.",
+            reply_markup=kb.main_menu(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    txt = f"📜 *Historial de {user.first_name}*\n\n"
+    for e in events[:10]:
+        txt += f"• `{e['created_at'][:16]}` — {e['event']}\n"
+
+    await q.edit_message_text(txt, reply_markup=kb.main_menu(), parse_mode=ParseMode.MARKDOWN)
+
+# ──────────────────────────────────────────────────────────────
+# SOPORTE
+# ──────────────────────────────────────────────────────────────
+async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_banned(update, context):
+        return
+
+    q = update.callback_query
+    await q.answer()
+
+    await q.edit_message_text(
+        "🎟️ *Centro de Soporte*\n\n"
+        "¿Tienes algún problema o consulta?\n"
+        "Crea un ticket y te responderemos a la brevedad.\n\n"
+        "_Tiempo de respuesta: 24-48h_",
+        reply_markup=kb.support_menu(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ──────────────────────────────────────────────────────────────
+# TICKETS - USUARIO
+# ──────────────────────────────────────────────────────────────
+async def ticket_new_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_banned(update, context):
+        return ConversationHandler.END
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "✏️ *Nuevo ticket de soporte*\n\n"
+        "Primero, ¿cuál es el *asunto* de tu consulta?\n"
+        "_(Ej: Problema con acceso, código no funciona, duda general)_",
+        reply_markup=kb.cancel_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return STATE_TICKET_SUBJECT
+
+async def ticket_subject_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["ticket_subject"] = update.message.text.strip()[:100]
+    await update.message.reply_text(
+        "💬 *Describe tu problema*\n\n"
+        "Cuéntanos con detalle qué sucede. Incluye toda la información que pueda ayudar a resolverlo más rápido.",
+        reply_markup=kb.cancel_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return STATE_TICKET_MESSAGE
+
+async def ticket_message_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    subject = context.user_data.get("ticket_subject", "Sin asunto")
+    content = update.message.text.strip()
+    ticket_id = await db.create_ticket(user.id, user.username or "", user.first_name, subject)
+    await db.add_ticket_message(ticket_id, user.id, content, is_admin=False)
+    await db.log_event("ticket", user.id, f"id={ticket_id}")
+    await update.message.reply_text(
+        f"✅ *Ticket #{ticket_id:04d} creado*\n\n"
+        f"📌 Asunto: _{subject}_\n\n"
+        "Te notificaremos cuando tengamos una respuesta. ¡Gracias por tu paciencia!",
+        reply_markup=kb.main_menu(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    admin_ids = await db.get_all_admin_ids()
+    for aid in admin_ids:
+        await notify_user(
+            context.bot, aid,
+            f"🎟️ *Nuevo ticket #{ticket_id:04d}*\n"
+            f"👤 {user.first_name} (`{user.id}`)\n"
+            f"📌 {subject}\n\n"
+            f"{content[:200]}...",
+            reply_markup=kb.admin_ticket_actions(ticket_id, True)
+        )
+    return ConversationHandler.END
+
+async def ticket_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_banned(update, context): return
+    q = update.callback_query; await q.answer()
+    tickets = await db.get_user_tickets(q.from_user.id)
+    if not tickets:
+        await q.edit_message_text("📭 No tienes tickets abiertos.", reply_markup=kb.main_menu())
+        return
+    txt = "🎟️ *Tus tickets*\n\n"
+    btns = []
+    for t in tickets[:10]:
+        status = "🟢" if t["status"] == "open" else "⚫"
+        txt += f"{status} *#{t['id']:04d}* — {t['subject'][:40]}\n"
+        btns.append([InlineKeyboardButton(f"Ticket #{t['id']:04d}", callback_data=f"ticket_view_{t['id']}")])
+    btns.append([InlineKeyboardButton("← Menú principal", callback_data="main_menu")])
+    await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.MARKDOWN)
+
+async def ticket_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    ticket = await db.get_ticket(tid)
+    if not ticket or ticket["user_id"] != q.from_user.id:
+        await q.answer("❌ Ticket no encontrado", show_alert=True); return
+    messages = await db.get_ticket_messages(tid)
+    txt = f"🎟️ *Ticket #{tid:04d}*\n📌 {ticket['subject']}\n🔘 Estado: {'🟢 Abierto' if ticket['status']=='open' else '⚫ Cerrado'}\n\n"
+    for m in messages[-5:]:
+        who = "👤 Tú" if not m["is_admin"] else "🛡️ Soporte"
+        txt += f"*{who}* `{m['sent_at'][:16]}`\n{m['message'][:200]}\n\n"
+    btns = []
+    if ticket["status"] == "open":
+        btns.append([InlineKeyboardButton("💬 Responder", callback_data=f"ticket_reply_{tid}")])
+        btns.append([InlineKeyboardButton("✅ Cerrar ticket", callback_data=f"ticket_close_{tid}")])
+    else:
+        btns.append([InlineKeyboardButton("🔄 Reabrir", callback_data=f"ticket_reopen_{tid}")])
+    btns.append([InlineKeyboardButton("← Mis tickets", callback_data="ticket_list")])
+    await q.edit_message_text(txt[:4000], reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.MARKDOWN)
+
+async def ticket_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    context.user_data["reply_ticket_id"] = tid
+    await q.edit_message_text(f"✍️ *Responder al ticket #{tid:04d}*\n\nEscribe tu mensaje:", reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    return STATE_TICKET_REPLY_USER
+
+async def ticket_reply_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    tid = context.user_data.get("reply_ticket_id")
+    if not tid: return ConversationHandler.END
+    await db.add_ticket_message(tid, user.id, update.message.text.strip(), is_admin=False)
+    await update.message.reply_text(f"✅ *Respuesta enviada al ticket #{tid:04d}*", reply_markup=kb.main_menu(), parse_mode=ParseMode.MARKDOWN)
+    admin_ids = await db.get_all_admin_ids()
+    for aid in admin_ids:
+        await notify_user(context.bot, aid, f"🔔 *Nueva respuesta en ticket #{tid:04d}*\n👤 {user.first_name}\n\n{update.message.text.strip()[:200]}", reply_markup=kb.admin_ticket_actions(tid, True))
+    return ConversationHandler.END
+
+async def ticket_close_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    await db.close_ticket(tid)
+    await q.edit_message_text(f"✅ *Ticket #{tid:04d} cerrado*", reply_markup=kb.main_menu(), parse_mode=ParseMode.MARKDOWN)
+
+async def ticket_reopen_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    await db.reopen_ticket(tid)
+    await q.edit_message_text(f"🔄 *Ticket #{tid:04d} reabierto*", reply_markup=kb.main_menu(), parse_mode=ParseMode.MARKDOWN)
+
+# ──────────────────────────────────────────────────────────────
+# ADMIN - TICKETS
+# ──────────────────────────────────────────────────────────────
+async def adm_tickets(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    open_c = len(await db.get_open_tickets())
+    await q.edit_message_text(
+        f"🎟️ *Gestión de Tickets*\n\n📂 Tickets abiertos: *{open_c}*",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🟢 Ver abiertos", callback_data="adm_tickets_open")],
+            [InlineKeyboardButton("📋 Ver todos", callback_data="adm_tickets_all")],
+            [InlineKeyboardButton("← Admin", callback_data="adm_panel")],
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def adm_tickets_open(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    tickets = await db.get_open_tickets()
+    if not tickets:
+        await q.edit_message_text("✅ Sin tickets abiertos", reply_markup=kb.admin_back())
+        return
+    btns = [[InlineKeyboardButton(f"#{t['id']:04d} {t['subject'][:25]}", callback_data=f"adm_tview_{t['id']}")] for t in tickets[:10]]
+    btns.append([InlineKeyboardButton("← Admin", callback_data="adm_panel")])
+    await q.edit_message_text("🟢 *Tickets abiertos*", reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_tickets_all(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    tickets = await db.get_all_tickets(20)
+    btns = []
+    for t in tickets:
+        icon = "🟢" if t["status"] == "open" else "⚫"
+        btns.append([InlineKeyboardButton(f"{icon} #{t['id']:04d} {t['subject'][:20]}", callback_data=f"adm_tview_{t['id']}")])
+    btns.append([InlineKeyboardButton("← Admin", callback_data="adm_panel")])
+    await q.edit_message_text("📋 *Todos los tickets*", reply_markup=InlineKeyboardMarkup(btns), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_ticket_view(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    ticket = await db.get_ticket(tid)
+    if not ticket: await q.answer("❌ Ticket no encontrado", show_alert=True); return
+    msgs = await db.get_ticket_messages(tid)
+    txt = f"🎟️ *Ticket #{tid:04d}*\n👤 {ticket['first_name']} (`{ticket['user_id']}`)\n📌 {ticket['subject']}\n🔘 Estado: {'🟢 Abierto' if ticket['status']=='open' else '⚫ Cerrado'}\n\n"
+    for m in msgs[-6:]:
+        who = "🛡️ Admin" if m["is_admin"] else "👤 Usuario"
+        txt += f"*{who}* `{m['sent_at'][:16]}`\n{m['message'][:200]}\n\n"
+    await q.edit_message_text(txt[:4000], reply_markup=kb.admin_ticket_actions(tid, ticket["status"]=="open"), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_ticket_reply_start(update, context):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    context.user_data["adm_reply_ticket"] = tid
+    await q.edit_message_text(f"✍️ *Responder al ticket #{tid:04d}*\n\nEscribe tu respuesta:", reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    return STATE_ADM_TICKET_REPLY
+
+async def adm_ticket_reply_message(update, context):
+    admin = update.effective_user
+    tid = context.user_data.get("adm_reply_ticket")
+    if not tid: return ConversationHandler.END
+    ticket = await db.get_ticket(tid)
+    await db.add_ticket_message(tid, admin.id, update.message.text.strip(), is_admin=True)
+    await update.message.reply_text(f"✅ *Respuesta enviada al ticket #{tid:04d}*", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+    if ticket:
+        await notify_user(context.bot, ticket["user_id"], f"🔔 *Nueva respuesta en tu ticket #{tid:04d}*\n\n{update.message.text.strip()[:500]}", reply_markup=kb.main_menu())
+    return ConversationHandler.END
+
+async def adm_ticket_close(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    await db.close_ticket(tid)
+    await q.edit_message_text(f"✅ *Ticket #{tid:04d} cerrado*", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_ticket_reopen(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    tid = int(q.data.split("_")[-1])
+    await db.reopen_ticket(tid)
+    await q.edit_message_text(f"🔄 *Ticket #{tid:04d} reabierto*", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+# ──────────────────────────────────────────────────────────────
+# ADMIN - PANEL PRINCIPAL
+# ──────────────────────────────────────────────────────────────
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id):
+        await update.message.reply_text("🚫 No tienes permisos para usar este comando.")
+        return
+    await update.message.reply_text(
+        "🛡️ *Panel de Administración*\n\nBienvenido al panel de control. Selecciona una opción:",
+        reply_markup=kb.admin_panel(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("🛡️ *Panel de Administración*", reply_markup=kb.admin_panel(), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_gen_code_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text(
+        "🔑 *Generar código VIP*\n\nSelecciona la duración del código:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📅 7 días", callback_data="adm_quick_7"),
+             InlineKeyboardButton("📅 15 días", callback_data="adm_quick_15")],
+            [InlineKeyboardButton("📅 30 días", callback_data="adm_quick_30"),
+             InlineKeyboardButton("📅 60 días", callback_data="adm_quick_60")],
+            [InlineKeyboardButton("📅 90 días", callback_data="adm_quick_90"),
+             InlineKeyboardButton("✏️ Personalizado", callback_data="adm_quick_custom")],
+            [InlineKeyboardButton("← Panel", callback_data="adm_panel")],
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return STATE_GEN_CODE
+
+async def adm_gen_code_quick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    q = update.callback_query; await q.answer()
+    data = q.data.split("_")[-1]
+    if data == "custom":
+        await q.edit_message_text("✏️ *Código personalizado*\n\nFormato: `días usos [nota]`\nEjemplo: `30 5 Clientes junio`", reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        return STATE_GEN_CODE
+    days = int(data)
+    code = await unique_code()
+    await db.create_code(code, days, 1, created_by=q.from_user.id)
+    await db.audit(q.from_user.id, "gen_code", code, f"days={days}")
+    await q.edit_message_text(f"✅ *Código generado*\n\n🔑 `{code}`\n📅 Días: *{days}*\n👤 Usos: *1*", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
+
+async def adm_gen_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    parts = update.message.text.strip().split()
+    try:
+        days = int(parts[0])
+        uses = int(parts[1]) if len(parts) > 1 else 1
+        note = " ".join(parts[2:]) if len(parts) > 2 else ""
+    except (ValueError, IndexError):
+        await update.message.reply_text("❌ *Formato inválido*\n\nUsa: `días usos [nota]`\nEjemplo: `30 5 Clientes`", parse_mode=ParseMode.MARKDOWN)
+        return STATE_GEN_CODE
+    code = await unique_code()
+    await db.create_code(code, days, uses, note, created_by=update.effective_user.id)
+    await db.audit(update.effective_user.id, "gen_code", code, f"days={days} uses={uses}")
+    await update.message.reply_text(f"✅ *Código generado*\n\n🔑 `{code}`\n📅 Días: *{days}*\n👤 Usos: *{uses}*\n📝 Nota: {note if note else 'Sin nota'}", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
+
+async def adm_list_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    codes = await db.get_active_codes()
+    if not codes:
+        await q.edit_message_text("📭 *Sin códigos activos*", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+        return
+    txt = "🔑 *Códigos activos*\n\n"
+    for c in codes[:20]:
+        remaining = c['max_uses'] - c['used_count']
+        txt += f"`{c['code']}` — {c['days']}d — {remaining}/{c['max_uses']} usos\n"
+    await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    members = await db.get_all_subscriptions()
+    if not members:
+        await q.edit_message_text("👥 *Sin miembros registrados*", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+        return
+    txt = f"👥 *Miembros activos ({len(members)})*\n\n"
+    for m in members[:20]:
+        d = days_left(m["expiry"])
+        emoji = "🟢" if d > 3 else ("🟡" if d > 1 else "🔴")
+        txt += f"{emoji} {m['first_name']} (`{m['user_id']}`) — {d}d\n"
+    await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    s = await db.get_stats_summary()
+    txt = (
+        f"📊 *Estadísticas*\n\n"
+        f"👥 Total miembros: *{s['total']}*\n"
+        f"✅ Activos: *{s['active']}*\n"
+        f"🆕 Nuevos hoy: *{s['new_today']}*\n"
+        f"⚠️ Vencen en 3d: *{s['expiring_3d']}*\n"
+        f"🔑 Códigos activos: *{s['codes']}*\n"
+        f"🎟️ Tickets abiertos: *{s['tickets_open']}*\n"
+        f"🚫 Bloqueados: *{s['banned']}*\n"
+        f"🎁 Pruebas usadas: *{s['trials']}*"
+    )
+    await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    rank = await db.get_ranking(10)
+    if not rank:
+        await q.edit_message_text("🏆 *Ranking VIP*\n\nSin datos todavía.", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+        return
+    txt = "🏆 *Top 10 VIP*\n\n"
+    medals = ["🥇", "🥈", "🥉", "🏅", "🏅", "🏅", "🏅", "🏅", "🏅", "🏅"]
+    for i, m in enumerate(rank):
+        txt += f"{medals[i]} {m['first_name']} — *{m['total_days']}d*\n"
+    await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text(
+        "📢 *Broadcast*\n\n¿A quién quieres enviar el mensaje?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Todos los miembros", callback_data="adm_bc_all")],
+            [InlineKeyboardButton("✅ Solo activos", callback_data="adm_bc_active")],
+            [InlineKeyboardButton("⚠️ Por vencer (3d)", callback_data="adm_bc_expiring")],
+            [InlineKeyboardButton("← Admin", callback_data="adm_panel")],
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def adm_broadcast_segment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    q = update.callback_query; await q.answer()
+    seg = q.data.replace("adm_bc_", "")
+    BROADCAST_FILTER["segment"] = seg
+    await q.edit_message_text(f"✍️ *Escribe el mensaje*\n\nSegmento seleccionado: *{seg}*\n\nRedacta el mensaje que quieres enviar:", reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    return STATE_BROADCAST_MSG
+
+async def adm_broadcast_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    seg = BROADCAST_FILTER.get("segment", "all")
+    context.user_data["bc_message"] = update.message.text.strip()
+    await update.message.reply_text(
+        f"📢 *Vista previa*\n\nSegmento: *{seg}*\n\n{context.user_data['bc_message']}\n\n¿Enviar ahora?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Enviar", callback_data="adm_broadcast_confirm")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data="adm_panel")],
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return ConversationHandler.END
+
+async def adm_broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer("📤 Enviando mensajes...")
+    seg = BROADCAST_FILTER.get("segment", "all")
+    txt = context.user_data.get("bc_message", "")
+    if not txt:
+        await q.edit_message_text("❌ Error: mensaje vacío", reply_markup=kb.admin_back())
+        return
+    if seg == "active":
+        members = [m for m in await db.get_all_subscriptions() if days_left(m["expiry"]) > 0]
+    elif seg == "expiring":
+        members = await db.get_expiring_soon(72)
+    else:
+        members = await db.get_all_subscriptions()
+    ok, fail = 0, 0
+    await q.edit_message_text(f"📤 Enviando a {len(members)} usuarios...")
+    for m in members:
+        try:
+            await context.bot.send_message(m["user_id"], txt, parse_mode=ParseMode.MARKDOWN)
+            ok += 1
+        except TelegramError:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await db.log_broadcast(txt, seg, ok, fail)
+    await q.edit_message_text(f"✅ *Broadcast completado*\n\n📨 Enviados: *{ok}*\n❌ Fallidos: *{fail}*", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_admins(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text(
+        "👑 *Gestión de administradores*",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Agregar admin", callback_data="adm_add_admin")],
+            [InlineKeyboardButton("➖ Remover admin", callback_data="adm_remove_admin")],
+            [InlineKeyboardButton("📋 Listar admins", callback_data="adm_list_admins")],
+            [InlineKeyboardButton("← Admin", callback_data="adm_panel")],
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def adm_list_admins(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    admins = await db.list_admins()
+    txt = f"👑 *Administradores*\n\n⭐ Admin principal: `{ADMIN_ID}`\n\n"
+    if admins:
+        for a in admins:
+            txt += f"• {a['first_name']} (`{a['user_id']}`)\n"
+    else:
+        txt += "_No hay admins secundarios._"
+    await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_add_admin_start(update, context):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("✏️ *Agregar admin*\n\nEscribe el *user_id* del nuevo administrador:", reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    return STATE_ADD_ADMIN
+
+async def adm_add_admin_received(update, context):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    try:
+        new_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ ID inválido. Debe ser un número.", parse_mode=ParseMode.MARKDOWN)
+        return STATE_ADD_ADMIN
+    await db.add_admin(new_id, "", "", update.effective_user.id)
+    await db.audit(update.effective_user.id, "add_admin", str(new_id))
+    await update.message.reply_text(f"✅ *Admin agregado*\n\nUsuario `{new_id}` ahora es administrador.", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
+
+async def adm_remove_admin_start(update, context):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("✏️ *Remover admin*\n\nEscribe el *user_id* del administrador a remover:", reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    return STATE_REMOVE_ADMIN
+
+async def adm_remove_admin_received(update, context):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    try:
+        rem_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ ID inválido. Debe ser un número.", parse_mode=ParseMode.MARKDOWN)
+        return STATE_REMOVE_ADMIN
+    if rem_id == ADMIN_ID:
+        await update.message.reply_text("❌ No puedes remover al admin principal.", parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+    await db.remove_admin(rem_id)
+    await db.audit(update.effective_user.id, "remove_admin", str(rem_id))
+    await update.message.reply_text(f"✅ *Admin removido*\n\nUsuario `{rem_id}` ya no es administrador.", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
+
+async def adm_blacklist(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text(
+        "🚫 *Lista negra*",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Banear usuario", callback_data="adm_ban_input")],
+            [InlineKeyboardButton("📋 Ver lista", callback_data="adm_blacklist_list")],
+            [InlineKeyboardButton("← Admin", callback_data="adm_panel")],
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def adm_ban_input_start(update, context):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("✏️ *Banear usuario*\n\nEscribe el *user_id* del usuario a banear:", reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    return STATE_BAN_INPUT
+
+async def adm_ban_input_received(update, context):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    try:
+        uid = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ ID inválido. Debe ser un número.", parse_mode=ParseMode.MARKDOWN)
+        return STATE_BAN_INPUT
+    await db.ban_user(uid, "Ban desde panel", update.effective_user.id)
+    await kick_from_channel(context.bot, uid)
+    await db.audit(update.effective_user.id, "ban", str(uid))
+    await update.message.reply_text(f"🚫 *Usuario baneado*\n\nUsuario `{uid}` agregado a la lista negra.", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
+
+async def adm_blacklist_list(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    bl = await db.get_blacklist()
+    if not bl:
+        await q.edit_message_text("✅ *Lista negra vacía*\n\nNo hay usuarios baneados.", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+        return
+    txt = "🚫 *Usuarios baneados*\n\n"
+    for b in bl[:20]:
+        txt += f"• `{b['user_id']}` — {b['reason'] or 'Sin razón'}\n"
+    await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+# ──────────────────────────────────────────────────────────────
+# NUEVAS FUNCIONES ADMIN: EXPULSAR MIEMBRO Y RESETEAR DATOS
+# ──────────────────────────────────────────────────────────────
+async def adm_kick_member_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inicia el proceso para expulsar a un miembro por user_id"""
+    if not await is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "✏️ *Expulsar miembro*\n\n"
+        "Escribe el *user_id* del usuario que quieres expulsar del canal:",
+        reply_markup=kb.cancel_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return STATE_KICK_MEMBER
+
+async def adm_kick_member_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Procesa el user_id y expulsa al miembro"""
+    if not await is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    try:
+        user_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ ID inválido. Debe ser un número.")
+        return ConversationHandler.END
+
+    try:
+        await context.bot.ban_chat_member(CHANNEL_ID, user_id)
+        await context.bot.unban_chat_member(CHANNEL_ID, user_id)
+        await update.message.reply_text(f"✅ Usuario `{user_id}` expulsado del canal.")
+        await db.audit(update.effective_user.id, "kick_member", str(user_id))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error al expulsar: {e}")
+
+    await update.message.reply_text("🛡️ *Panel de Administración*", reply_markup=kb.admin_panel(), parse_mode=ParseMode.MARKDOWN)
+    return ConversationHandler.END
+
+async def adm_reset_data_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra confirmación para resetear datos"""
+    if not await is_admin(update.effective_user.id):
+        return
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "⚠️ *¿Resetear todos los datos?*\n\n"
+        "Esta acción eliminará:\n"
+        "• Todos los códigos (activos e inactivos)\n"
+        "• Todas las suscripciones\n"
+        "• Estadísticas y logs\n\n"
+        "¿Estás seguro?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Sí, resetear", callback_data="adm_reset_execute")],
+            [InlineKeyboardButton("❌ Cancelar", callback_data="adm_panel")],
+        ]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def adm_reset_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ejecuta el reseteo de la base de datos"""
+    if not await is_admin(update.effective_user.id):
+        return
+    q = update.callback_query
+    await q.answer()
+
+    try:
+        await db.run("DELETE FROM codes")
+        await db.run("DELETE FROM subscriptions")
+        await db.run("DELETE FROM stats")
+        await db.run("DELETE FROM audit_log")
+        await db.run("DELETE FROM broadcast_log")
+        await db.run("DELETE FROM free_trials")
+        await db.run("DELETE FROM support_tickets")
+        await db.run("DELETE FROM ticket_messages")
+
+        await q.edit_message_text(
+            "✅ *Datos reseteados correctamente*",
+            reply_markup=kb.admin_back(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        await db.audit(update.effective_user.id, "reset_data", "all")
+    except Exception as e:
+        await q.edit_message_text(f"❌ Error al resetear: {e}", reply_markup=kb.admin_back())
+
+# ──────────────────────────────────────────────────────────────
+# OTRAS FUNCIONES ADMIN (mantenimiento)
+# ──────────────────────────────────────────────────────────────
+async def adm_clean_expired(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer("🧹 Limpiando...")
+    expired = await db.get_expired_members()
+    for m in expired:
+        await kick_from_channel(context.bot, m["user_id"])
+        await db.delete_subscription(m["user_id"])
+    await q.edit_message_text(f"✅ *Limpieza completada*\n\nSe eliminaron *{len(expired)}* miembros vencidos.", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_export_csv(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer("📤 Generando CSV...")
+    csv_data = await db.export_members_csv()
+    await context.bot.send_document(
+        q.from_user.id,
+        document=io.BytesIO(csv_data.encode()),
+        filename=f"miembros_{datetime.now().strftime('%Y%m%d')}.csv",
+        caption="📊 Exportación de miembros"
+    )
+    await q.edit_message_text("✅ *CSV enviado*", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_backup(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer("💾 Generando backup...")
+    try:
+        with open("vip_bot.db", "rb") as f:
+            await context.bot.send_document(q.from_user.id, document=f, filename=f"backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db", caption="🗄️ Backup de base de datos")
+        await q.edit_message_text("✅ *Backup enviado*", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await q.edit_message_text(f"❌ Error: {str(e)}", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_audit_log(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    logs = await db.get_audit_log(30)
+    if not logs:
+        await q.edit_message_text("📋 *Log de auditoría*\n\nSin registros.", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+        return
+    txt = "📋 *Últimas acciones*\n\n"
+    for l in logs:
+        txt += f"`{l['created_at'][:16]}` *{l['action']}* {l['target'] or ''}\n"
+    await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+async def adm_broadcast_history(update, context):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query; await q.answer()
+    history = await db.get_broadcast_history(10)
+    if not history:
+        await q.edit_message_text("📜 *Historial de broadcasts*\n\nSin registros.", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+        return
+    txt = "📜 *Últimos broadcasts*\n\n"
+    for b in history:
+        txt += f"`{b['created_at'][:16]}` [{b['filter_type']}] ✅{b['sent_to']} ❌{b['failed']}\n"
+    await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+# ──────────────────────────────────────────────────────────────
+# COMANDOS DIRECTOS (ADMIN)
+# ──────────────────────────────────────────────────────────────
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Uso: /ban <user_id> [razón]")
+        return
+    try:
+        uid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id inválido")
+        return
+    reason = " ".join(args[1:]) or "Sin razón"
+    await db.ban_user(uid, reason, update.effective_user.id)
+    await kick_from_channel(context.bot, uid)
+    await update.message.reply_text(f"🚫 Usuario `{uid}` baneado.")
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Uso: /unban <user_id>")
+        return
+    try:
+        uid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id inválido")
+        return
+    await db.unban_user(uid)
+    await update.message.reply_text(f"✅ Usuario `{uid}` desbaneado.")
+
+async def adddays_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Uso: /adddays <user_id> <días>")
+        return
+    try:
+        uid = int(args[0])
+        days = int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Valores inválidos")
+        return
+    sub = await db.get_subscription(uid)
+    if not sub:
+        await update.message.reply_text(f"❌ Usuario `{uid}` sin membresía")
+        return
+    await db.add_days_to_subscription(uid, days)
+    await db.audit(update.effective_user.id, "adddays", str(uid), f"+{days}d")
+    await update.message.reply_text(f"✅ +{days} días a `{uid}`")
+
+async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Uso: /addadmin <user_id>")
+        return
+    try:
+        uid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id inválido")
+        return
+    await db.add_admin(uid, "", "", update.effective_user.id)
+    await update.message.reply_text(f"✅ Admin `{uid}` agregado.")
+
+async def removeadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Uso: /removeadmin <user_id>")
+        return
+    try:
+        uid = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id inválido")
+        return
+    if uid == ADMIN_ID:
+        await update.message.reply_text("❌ No puedes remover al admin principal")
+        return
+    await db.remove_admin(uid)
+    await update.message.reply_text(f"✅ Admin `{uid}` removido.")
+
+# ──────────────────────────────────────────────────────────────
+# AUTO-RESPUESTA
+# ──────────────────────────────────────────────────────────────
+async def auto_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await check_banned(update, context): return
+    user = update.effective_user
+    text = (update.message.text or "").lower()
+    sub = await db.get_subscription(user.id)
+    if not sub or days_left(sub["expiry"]) <= 0:
+        await update.message.reply_text(
+            f"👋 *Hola {user.first_name}*\n\nPara usar el bot, primero necesitas activar un código VIP.\n\n🔑 Por favor, escribe tu código aquí:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔑 Activar código", callback_data="activate")
+            ]]),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    responses = {
+        ("hola", "hi", "buenas", "hey"): f"👋 ¡Hola {user.first_name}! ¿En qué puedo ayudarte?",
+        ("gracias", "thanks", "ty"): f"🙌 ¡Con gusto, {user.first_name}!",
+        ("menu", "menú"): "📍 Usa los botones del menú para navegar.",
+        ("codigo", "código", "activar"): "🔑 Ve a *Activar código* en el menú.",
+        ("canal", "acceso"): "📢 El link de acceso está en tu mensaje de activación.",
+    }
+    for keywords, reply in responses.items():
+        if any(k in text for k in keywords):
+            await update.message.reply_text(reply, reply_markup=kb.main_menu())
+            return
+    await update.message.reply_text(
+        f"💬 *Hola {user.first_name}*\n\nUsa los botones del menú para acceder a las funciones del bot.",
+        reply_markup=kb.main_menu(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ──────────────────────────────────────────────────────────────
+# JOBS AUTOMÁTICOS
+# ──────────────────────────────────────────────────────────────
+async def job_clean_expired(context: ContextTypes.DEFAULT_TYPE):
+    expired = await db.get_expired_members()
+    for m in expired:
+        await kick_from_channel(context.bot, m["user_id"])
+        await db.delete_subscription(m["user_id"])
+        try:
+            await context.bot.send_message(m["user_id"], "⏰ *Tu membresía ha vencido*\n\nHas sido removido del canal VIP.\nActiva un nuevo código para recuperar el acceso.", parse_mode=ParseMode.MARKDOWN)
+        except TelegramError: pass
+    if expired: logger.info(f"🧹 Limpieza: {len(expired)} miembros eliminados")
+
+async def job_warn_expiring(context: ContextTypes.DEFAULT_TYPE):
+    for hours in [72, 24, 1]:
+        members = await db.get_expiring_soon(hours)
+        for m in members:
+            d_left = days_left(m["expiry"])
+            if hours == 72:
+                text = f"⚠️ *Tu membresía vence en 3 días*\n\n📅 Vencimiento: `{m['expiry'][:16]}`\n⏳ Días restantes: *{d_left}*\n\nRenueva pronto para no perder acceso."
+            elif hours == 24:
+                text = f"🔔 *Tu membresía vence MAÑANA*\n\n📅 Vencimiento: `{m['expiry'][:16]}`\n⏳ Días restantes: *{d_left}*\n\n¡Renueva hoy mismo!"
+            else:
+                text = f"🚨 *¡ÚLTIMAS HORAS!*\n\nTu membresía vence en *menos de 1 hora*.\nRenueva ahora para no perder el acceso."
+            await notify_user(context.bot, m["user_id"], text, reply_markup=kb.main_menu())
+
+async def job_calendar_alerts(context: ContextTypes.DEFAULT_TYPE):
+    global _alerted_events, _calendar_cache
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if not _calendar_cache["fetched_at"] or (now_ts - _calendar_cache["fetched_at"]) > CALENDAR_CACHE_SECONDS:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json") as resp:
+                    events = await resp.json()
+            _calendar_cache["events"] = events
+            _calendar_cache["fetched_at"] = now_ts
+        except Exception as e:
+            logger.warning(f"Error calendario: {e}")
+            return
+    now = datetime.now(timezone.utc)
+    alert_window = now + timedelta(minutes=35)
+    upcoming = []
+    for ev in _calendar_cache.get("events", []):
+        if ev.get("impact", "").lower() != "high": continue
+        try:
+            ev_dt = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
+        except Exception: continue
+        if now <= ev_dt <= alert_window:
+            ev_id = f"{ev.get('title')}_{ev_dt.strftime('%Y%m%d%H%M')}"
+            if ev_id not in _alerted_events:
+                upcoming.append((ev, ev_dt, ev_id))
+    if not upcoming: return
+    members = await db.get_active_members()
+    if not members: return
+    flags = {"USD":"🇺🇸","EUR":"🇪🇺","GBP":"🇬🇧","JPY":"🇯🇵","CAD":"🇨🇦","AUD":"🇦🇺","NZD":"🇳🇿","CHF":"🇨🇭"}
+    for ev, ev_dt, ev_id in upcoming:
+        mins = int((ev_dt - now).total_seconds() / 60)
+        flag = flags.get(ev.get("country", ""), "🌐")
+        text = f"🔴 *ALERTA - ALTO IMPACTO*\n\n📌 *{ev.get('title')}*\n{flag} {ev.get('country')}  |  🕐 {ev_dt.strftime('%H:%M')} UTC\n⏱ En *{mins} minutos*\n\nPrepárate para alta volatilidad."
+        sent = 0
+        for m in members:
+            try:
+                await context.bot.send_message(m["user_id"], text, parse_mode=ParseMode.MARKDOWN)
+                sent += 1
+            except TelegramError: pass
+        _alerted_events.add(ev_id)
+        logger.info(f"📢 Alerta: {ev.get('title')} → {sent} usuarios")
+
+async def job_crypto_news(context: ContextTypes.DEFAULT_TYPE):
+    global _seen_news_links
+    items = await refresh_news_cache()
+    if not items: return
+    new_items = [it for it in items if it.get("link") and it["link"] not in _seen_news_links]
+    if not new_items: return
+    for item in new_items[:3]:
+        title = item.get("title", "").strip()
+        link = item.get("link", "").strip()
+        source = item.get("source", "Crypto News")
+        if not title or not link: continue
+        text = f"📰 *{title}*\n\n📡 {source}\n\n🔗 {link}"
+        try:
+            await context.bot.send_message(CHANNEL_ID, text, parse_mode=ParseMode.MARKDOWN)
+            _seen_news_links.add(link)
+            await asyncio.sleep(2)
+        except TelegramError as e:
+            logger.warning(f"Error publicando: {e}")
+    if len(_seen_news_links) > 200:
+        _seen_news_links = set(list(_seen_news_links)[-200:])
+
+async def job_daily_summary(context: ContextTypes.DEFAULT_TYPE):
+    stats = await db.get_stats_summary()
+    admin_ids = await db.get_all_admin_ids()
+    text = f"📊 *Resumen diario*\n\n👥 Activos: *{stats['active']}*\n📆 Nuevos hoy: *{stats['new_today']}*\n⚠️ Vencen pronto: *{stats['expiring_3d']}*\n🎟️ Tickets abiertos: *{stats['tickets_open']}*"
+    for aid in admin_ids:
+        await notify_user(context.bot, aid, text)
+
+# ──────────────────────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────────────────────
+def main():
+    async def _run():
+        await db.init_db()
+        if not BOT_TOKEN:
+            logger.critical("BOT_TOKEN no configurado")
+            return
+        await start_api_server()
+        app = Application.builder().token(BOT_TOKEN).build()
+
+        # Conversaciones
+        convs = [
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(activate_start, pattern="^activate$"), MessageHandler(filters.TEXT & ~filters.COMMAND, activate_start)],
+                states={STATE_ACTIVATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, activate_code)]},
+                fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^main_menu$")],
+                conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(renew_start, pattern="^renew$")],
+                states={STATE_RENEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, renew_code)]},
+                fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^main_menu$")],
+                conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_gen_code_menu, pattern="^adm_gen_code$")],
+                states={STATE_GEN_CODE: [CallbackQueryHandler(adm_gen_code_quick, pattern="^adm_quick_"), MessageHandler(filters.TEXT & ~filters.COMMAND, adm_gen_code_input)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
+                conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_ban_input_start, pattern="^adm_ban_input$")],
+                states={STATE_BAN_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ban_input_received)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
+                conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_broadcast_segment, pattern="^adm_bc_")],
+                states={STATE_BROADCAST_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_broadcast_preview)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
+                conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(ticket_new_start, pattern="^ticket_new$")],
+                states={STATE_TICKET_SUBJECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_subject_received)], STATE_TICKET_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_message_received)]},
+                fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^main_menu$")],
+                conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(ticket_reply_start, pattern="^ticket_reply_")],
+                states={STATE_TICKET_REPLY_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_reply_user_message)]},
+                fallbacks=[CallbackQueryHandler(main_menu_callback, pattern="^main_menu$")],
+                conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_ticket_reply_start, pattern="^adm_ticket_reply_")],
+                states={STATE_ADM_TICKET_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ticket_reply_message)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
+                conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_add_admin_start, pattern="^adm_add_admin$")],
+                states={STATE_ADD_ADMIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_admin_received)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
+                conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_remove_admin_start, pattern="^adm_remove_admin$")],
+                states={STATE_REMOVE_ADMIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_remove_admin_received)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
+                conversation_timeout=300
+            ),
+            # NUEVO: Expulsar miembro
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_kick_member_start, pattern="^adm_kick_member$")],
+                states={STATE_KICK_MEMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_kick_member_received)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
+                conversation_timeout=300
+            ),
+        ]
+        for conv in convs:
+            app.add_handler(conv)
+
+        # Comandos
+        app.add_handler(CommandHandler("start", start_handler))
+        app.add_handler(CommandHandler("admin", admin_command))
+        app.add_handler(CommandHandler("ban", ban_command))
+        app.add_handler(CommandHandler("unban", unban_command))
+        app.add_handler(CommandHandler("adddays", adddays_command))
+        app.add_handler(CommandHandler("addadmin", addadmin_command))
+        app.add_handler(CommandHandler("removeadmin", removeadmin_command))
+
+        # Callbacks de usuario
+        app.add_handler(CallbackQueryHandler(main_menu_callback, pattern="^main_menu$"))
+        app.add_handler(CallbackQueryHandler(free_trial_callback, pattern="^free_trial$"))
+        app.add_handler(CallbackQueryHandler(history_callback, pattern="^history$"))
+        app.add_handler(CallbackQueryHandler(support_callback, pattern="^support$"))
+        app.add_handler(CallbackQueryHandler(ticket_list_callback, pattern="^ticket_list$"))
+        app.add_handler(CallbackQueryHandler(ticket_view_callback, pattern="^ticket_view_"))
+        app.add_handler(CallbackQueryHandler(ticket_close_user, pattern="^ticket_close_"))
+        app.add_handler(CallbackQueryHandler(ticket_reopen_user, pattern="^ticket_reopen_"))
+
+        # Callbacks de admin
+        app.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$"))
+        app.add_handler(CallbackQueryHandler(adm_list_codes, pattern="^adm_list_codes$"))
+        app.add_handler(CallbackQueryHandler(adm_members, pattern="^adm_members$"))
+        app.add_handler(CallbackQueryHandler(adm_stats, pattern="^adm_stats$"))
+        app.add_handler(CallbackQueryHandler(adm_ranking, pattern="^adm_ranking$"))
+        app.add_handler(CallbackQueryHandler(adm_admins, pattern="^adm_admins$"))
+        app.add_handler(CallbackQueryHandler(adm_list_admins, pattern="^adm_list_admins$"))
+        app.add_handler(CallbackQueryHandler(adm_blacklist, pattern="^adm_blacklist$"))
+        app.add_handler(CallbackQueryHandler(adm_blacklist_list, pattern="^adm_blacklist_list$"))
+        app.add_handler(CallbackQueryHandler(adm_broadcast, pattern="^adm_broadcast$"))
+        app.add_handler(CallbackQueryHandler(adm_broadcast_confirm, pattern="^adm_broadcast_confirm$"))
+        app.add_handler(CallbackQueryHandler(adm_clean_expired, pattern="^adm_clean_expired$"))
+        app.add_handler(CallbackQueryHandler(adm_export_csv, pattern="^adm_export_csv$"))
+        app.add_handler(CallbackQueryHandler(adm_backup, pattern="^adm_backup$"))
+        app.add_handler(CallbackQueryHandler(adm_audit_log, pattern="^adm_audit_log$"))
+        app.add_handler(CallbackQueryHandler(adm_broadcast_history, pattern="^adm_broadcast_history$"))
+        app.add_handler(CallbackQueryHandler(adm_tickets, pattern="^adm_tickets$"))
+        app.add_handler(CallbackQueryHandler(adm_tickets_open, pattern="^adm_tickets_open$"))
+        app.add_handler(CallbackQueryHandler(adm_tickets_all, pattern="^adm_tickets_all$"))
+        app.add_handler(CallbackQueryHandler(adm_ticket_view, pattern="^adm_tview_"))
+        app.add_handler(CallbackQueryHandler(adm_ticket_close, pattern="^adm_ticket_close_"))
+        app.add_handler(CallbackQueryHandler(adm_ticket_reopen, pattern="^adm_ticket_reopen_"))
+        # NUEVOS
+        app.add_handler(CallbackQueryHandler(adm_reset_data_confirm, pattern="^adm_reset_data$"))
+        app.add_handler(CallbackQueryHandler(adm_reset_execute, pattern="^adm_reset_execute$"))
+
+        # Auto-respuesta
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_reply))
+
+        # Jobs
+        jq = app.job_queue
+        jq.run_repeating(job_clean_expired, interval=3600, first=60)
+        jq.run_repeating(job_warn_expiring, interval=43200, first=120)
+        jq.run_repeating(job_calendar_alerts, interval=900, first=30)
+        jq.run_repeating(job_crypto_news, interval=1800, first=90)
+        jq.run_daily(job_daily_summary, time=datetime.strptime("08:00", "%H:%M").time())
+
+        logger.info(f"🚀 Bot iniciado | Canal: {CHANNEL_ID}")
+
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+
+        import signal
+        stop_event = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop_event.set)
+        await stop_event.wait()
+
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+    asyncio.run(_run())
+
+if __name__ == "__main__":
+    main()
