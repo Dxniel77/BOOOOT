@@ -1,5 +1,6 @@
 """
 bot.py — VIP Bot · Versión final con panel admin simplificado y expulsión automática
+Corregido: eliminados handlers de admin que ya no se usan.
 """
 
 import hashlib
@@ -263,12 +264,9 @@ async def start_api_server():
     STATE_TICKET_MESSAGE,
     STATE_TICKET_REPLY_USER,
     STATE_ADM_TICKET_REPLY,
-    STATE_ADD_ADMIN,
-    STATE_REMOVE_ADMIN,
     STATE_ADDDAYS_INPUT,
     STATE_KICK_MEMBER,
-    STATE_RESET_CONFIRM,
-) = range(15)
+) = range(12)  # Eliminados los estados de agregar/remover admin
 
 BROADCAST_FILTER = {}
 
@@ -516,7 +514,7 @@ async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("🎟️ *Centro de Soporte*\n\n¿Tienes algún problema o consulta?\nCrea un ticket y te responderemos a la brevedad.\n\n_Tiempo de respuesta: 24-48h_", reply_markup=kb.support_menu(), parse_mode=ParseMode.MARKDOWN)
 
 # ──────────────────────────────────────────────────────────────
-# TICKETS - USUARIO (resumido)
+# TICKETS - USUARIO
 # ──────────────────────────────────────────────────────────────
 async def ticket_new_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await check_banned(update, context): return ConversationHandler.END
@@ -617,7 +615,7 @@ async def ticket_reopen_user(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await q.edit_message_text(f"🔄 *Ticket #{tid:04d} reabierto*", reply_markup=kb.main_menu(), parse_mode=ParseMode.MARKDOWN)
 
 # ──────────────────────────────────────────────────────────────
-# ADMIN - TICKETS (resumido)
+# ADMIN - TICKETS
 # ──────────────────────────────────────────────────────────────
 async def adm_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id): return
@@ -1041,37 +1039,6 @@ async def adddays_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.audit(update.effective_user.id, "adddays", str(uid), f"+{days}d")
     await update.message.reply_text(f"✅ +{days} días a `{uid}`")
 
-async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Uso: /addadmin <user_id>")
-        return
-    try:
-        uid = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ user_id inválido")
-        return
-    await db.add_admin(uid, "", "", update.effective_user.id)
-    await update.message.reply_text(f"✅ Admin `{uid}` agregado.")
-
-async def removeadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update.effective_user.id): return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Uso: /removeadmin <user_id>")
-        return
-    try:
-        uid = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ user_id inválido")
-        return
-    if uid == ADMIN_ID:
-        await update.message.reply_text("❌ No puedes remover al admin principal")
-        return
-    await db.remove_admin(uid)
-    await update.message.reply_text(f"✅ Admin `{uid}` removido.")
-
 # ──────────────────────────────────────────────────────────────
 # AUTO-RESPUESTA
 # ──────────────────────────────────────────────────────────────
@@ -1265,18 +1232,6 @@ def main():
                 fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
                 conversation_timeout=300
             ),
-            ConversationHandler(
-                entry_points=[CallbackQueryHandler(adm_add_admin_start, pattern="^adm_add_admin$")],
-                states={STATE_ADD_ADMIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_admin_received)]},
-                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
-                conversation_timeout=300
-            ),
-            ConversationHandler(
-                entry_points=[CallbackQueryHandler(adm_remove_admin_start, pattern="^adm_remove_admin$")],
-                states={STATE_REMOVE_ADMIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_remove_admin_received)]},
-                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
-                conversation_timeout=300
-            ),
             # Expulsar miembro
             ConversationHandler(
                 entry_points=[CallbackQueryHandler(adm_kick_member_start, pattern="^adm_kick_member$")],
@@ -1294,8 +1249,6 @@ def main():
         app.add_handler(CommandHandler("ban", ban_command))
         app.add_handler(CommandHandler("unban", unban_command))
         app.add_handler(CommandHandler("adddays", adddays_command))
-        app.add_handler(CommandHandler("addadmin", addadmin_command))
-        app.add_handler(CommandHandler("removeadmin", removeadmin_command))
 
         # Callbacks de usuario
         app.add_handler(CallbackQueryHandler(main_menu_callback, pattern="^main_menu$"))
