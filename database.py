@@ -1,5 +1,6 @@
 """
 database.py — VIP Bot · Capa de datos async (SQLite + WAL)
+Corregido: añadida función get_active_codes()
 """
 
 import asyncio
@@ -137,13 +138,11 @@ async def run(fn, *args):
 # ADMINS
 # ──────────────────────────────────────────────────────────────
 async def get_all_admin_ids() -> list[int]:
-    """Retorna lista de IDs de admins desde DB + ADMIN_ID del entorno."""
     def _f():
         with get_conn() as conn:
             rows = conn.execute("SELECT user_id FROM admins").fetchall()
             return [r["user_id"] for r in rows]
     db_admins = await run(_f)
-    # Siempre incluir el admin principal del entorno
     main_admin = int(os.getenv("ADMIN_ID", "0"))
     if main_admin and main_admin not in db_admins:
         db_admins.append(main_admin)
@@ -196,7 +195,6 @@ async def get_code(code: str) -> Optional[sqlite3.Row]:
             row = conn.execute("SELECT * FROM codes WHERE code=? AND is_active=1", (c,)).fetchone()
             if not row:
                 return None
-            # Verificar si el código tiene fecha de expiración vencida
             if row["expires_at"]:
                 exp = datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
                 if datetime.now(timezone.utc) > exp:
@@ -225,6 +223,16 @@ async def list_codes(active_only: bool = False) -> list:
             q += " ORDER BY created_at DESC"
             return conn.execute(q).fetchall()
     return await run(_f, active_only)
+
+# ===== FUNCIÓN NUEVA AGREGADA =====
+async def get_active_codes() -> list:
+    """Retorna todos los códigos activos no expirados"""
+    def _f():
+        with get_conn() as conn:
+            return conn.execute(
+                "SELECT * FROM codes WHERE is_active=1 AND (expires_at IS NULL OR expires_at > datetime('now')) ORDER BY created_at DESC"
+            ).fetchall()
+    return await run(_f)
 
 async def delete_code(code: str):
     def _f(c):
@@ -281,6 +289,12 @@ async def add_days_to_subscription(user_id: int, days: int) -> bool:
             return True
     return await run(_f, user_id, days)
 
+async def get_all_subscriptions() -> list:
+    def _f():
+        with get_conn() as conn:
+            return conn.execute("SELECT * FROM subscriptions ORDER BY expiry DESC").fetchall()
+    return await run(_f)
+
 async def get_active_members() -> list:
     def _f():
         with get_conn() as conn:
@@ -307,7 +321,6 @@ async def get_expiring_soon(hours: int) -> list:
     return await run(_f, hours)
 
 async def get_members_by_days_range(min_days: int, max_days: int) -> list:
-    """Para broadcast segmentado."""
     def _f(mn, mx):
         with get_conn() as conn:
             return conn.execute(
@@ -318,7 +331,6 @@ async def get_members_by_days_range(min_days: int, max_days: int) -> list:
     return await run(_f, min_days, max_days)
 
 async def export_members_csv() -> str:
-    """Retorna string CSV con todos los miembros."""
     def _f():
         with get_conn() as conn:
             rows = conn.execute(
@@ -411,7 +423,7 @@ async def get_stats_summary() -> dict:
                 "total": total, "active": active, "codes": codes_,
                 "banned": banned, "trials": trials, "new_today": new_today,
                 "tickets_open": tickets_open, "expiring_3d": expiring_3d,
-                "admins": admins_count + 1  # +1 por admin principal
+                "admins": admins_count + 1
             }
     return await run(_f)
 
