@@ -7,9 +7,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 MINIAPP_URL = "https://dxniel77.github.io/botFF/"
 
 
-# ══════════════════════════════════════════════════════════════
-# USUARIO — Menú principal
-# ══════════════════════════════════════════════════════════════
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -29,9 +26,6 @@ def main_menu() -> InlineKeyboardMarkup:
     ])
 
 
-# ══════════════════════════════════════════════════════════════
-# USUARIO — Soporte / Tickets
-# ══════════════════════════════════════════════════════════════
 def support_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Abrir nuevo ticket", callback_data="ticket_new")],
@@ -39,25 +33,12 @@ def support_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🏠 Menú principal", callback_data="main_menu")],
     ])
 
-def ticket_user_actions(ticket_id: int, is_open: bool) -> InlineKeyboardMarkup:
-    rows = []
-    if is_open:
-        rows.append([InlineKeyboardButton("💬 Responder", callback_data=f"ticket_reply_{ticket_id}")])
-        rows.append([InlineKeyboardButton("✅ Cerrar ticket", callback_data=f"ticket_close_{ticket_id}")])
-    else:
-        rows.append([InlineKeyboardButton("🔄 Reabrir ticket", callback_data=f"ticket_reopen_{ticket_id}")])
-    rows.append([InlineKeyboardButton("« Volver", callback_data="ticket_list")])
-    return InlineKeyboardMarkup(rows)
-
 def cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("❌ Cancelar", callback_data="main_menu")
     ]])
 
 
-# ══════════════════════════════════════════════════════════════
-# ADMIN — Panel principal
-# ══════════════════════════════════════════════════════════════
 def admin_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -69,16 +50,16 @@ def admin_panel() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📊 Estadísticas", callback_data="adm_stats"),
         ],
         [
-            InlineKeyboardButton("🎟️ Tickets", callback_data="adm_tickets"),
-            InlineKeyboardButton("🏆 Ranking", callback_data="adm_ranking"),
+            InlineKeyboardButton("🚫 Expulsar miembro", callback_data="adm_kick_member"),  # NUEVO
+            InlineKeyboardButton("🔄 Resetear datos", callback_data="adm_reset_data"),    # NUEVO
         ],
         [
-            InlineKeyboardButton("🚫 Blacklist", callback_data="adm_blacklist"),
+            InlineKeyboardButton("🏆 Ranking", callback_data="adm_ranking"),
             InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast"),
         ],
         [
-            InlineKeyboardButton("👑 Admins", callback_data="adm_admins"),
-            InlineKeyboardButton("🔧 Mantenimiento", callback_data="adm_maintenance"),
+            InlineKeyboardButton("🚫 Blacklist", callback_data="adm_blacklist"),
+            InlineKeyboardButton("🎟️ Tickets", callback_data="adm_tickets"),
         ],
     ])
 
@@ -88,9 +69,6 @@ def admin_back() -> InlineKeyboardMarkup:
     ]])
 
 
-# ══════════════════════════════════════════════════════════════
-# ADMIN — Tickets
-# ══════════════════════════════════════════════════════════════
 def admin_ticket_actions(ticket_id: int, is_open: bool) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("💬 Responder", callback_data=f"adm_ticket_reply_{ticket_id}")]]
     if is_open:
@@ -101,9 +79,6 @@ def admin_ticket_actions(ticket_id: int, is_open: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-# ══════════════════════════════════════════════════════════════
-# ADMIN — Mantenimiento
-# ══════════════════════════════════════════════════════════════
 def admin_maintenance_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧹 Limpiar vencidos", callback_data="adm_clean_expired")],
