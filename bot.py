@@ -1,6 +1,5 @@
 """
-bot.py — VIP Bot · Versión final con panel admin simplificado y expulsión automática
-Corregido: eliminados handlers de admin que ya no se usan.
+bot.py — VIP Bot · Versión final con gestión de admins y sin noticias/calendario
 """
 
 import hashlib
@@ -14,10 +13,8 @@ import secrets
 import string
 import asyncio
 import time
-import xml.etree.ElementTree as ET
 import aiohttp
 from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
 from urllib.parse import parse_qsl, unquote
 
 from aiohttp import web
@@ -60,30 +57,6 @@ _admin_cache = {
 CACHE_DURATION = 60  # segundos
 
 # ──────────────────────────────────────────────────────────────
-# CACHÉ PARA NOTICIAS Y CALENDARIO
-# ──────────────────────────────────────────────────────────────
-_news_cache: dict = {"items": [], "fetched_at": None}
-_calendar_cache: dict = {"events": [], "fetched_at": None}
-_alerted_events: set = set()
-_seen_news_links: set = set()
-
-NEWS_CACHE_SECONDS     = 600    # 10 minutos
-CALENDAR_CACHE_SECONDS = 1800   # 30 minutos
-
-# ──────────────────────────────────────────────────────────────
-# FUENTES RSS
-# ──────────────────────────────────────────────────────────────
-RSS_SOURCES = [
-    ("🇪🇸 Cointelegraph ES",  "https://es.cointelegraph.com/rss",                    "es"),
-    ("🇪🇸 BeInCrypto ES",     "https://es.beincrypto.com/feed/",                     "es"),
-    ("🇪🇸 CriptoNoticias",    "https://www.criptonoticias.com/feed/",                 "es"),
-    ("🇺🇸 Cointelegraph EN",  "https://cointelegraph.com/rss",                       "en"),
-    ("🇺🇸 CoinDesk",          "https://www.coindesk.com/arc/outboundfeeds/rss/",     "en"),
-    ("🇺🇸 Decrypt",           "https://decrypt.co/feed",                             "en"),
-    ("🇺🇸 ForexLive",         "https://www.forexlive.com/feed/news",                 "en"),
-]
-
-# ──────────────────────────────────────────────────────────────
 # CORS HEADERS
 # ──────────────────────────────────────────────────────────────
 CORS = {
@@ -110,7 +83,7 @@ def verify_telegram_init_data(init_data: str, bot_token: str) -> dict | None:
         return None
 
 # ──────────────────────────────────────────────────────────────
-# API ENDPOINTS
+# API ENDPOINTS (solo user_info)
 # ──────────────────────────────────────────────────────────────
 async def api_user_info(request: web.Request) -> web.Response:
     if request.method == "OPTIONS":
@@ -148,91 +121,6 @@ async def api_user_info(request: web.Request) -> web.Response:
         "is_expired": now_dt > expiry_dt,
     }, headers=CORS)
 
-async def api_news(request: web.Request) -> web.Response:
-    if request.method == "OPTIONS":
-        return web.Response(status=204, headers=CORS)
-    items = await refresh_news_cache()
-    now = datetime.now(timezone.utc).timestamp()
-    if not items:
-        return web.json_response({"error": "no_data", "items": []}, status=503, headers=CORS)
-    return web.json_response({
-        "items": items[:20],
-        "cached": True,
-        "fetched_at": _news_cache["fetched_at"],
-        "total": len(items),
-    }, headers=CORS)
-
-async def api_calendar(request: web.Request) -> web.Response:
-    if request.method == "OPTIONS":
-        return web.Response(status=204, headers=CORS)
-    now = datetime.now(timezone.utc).timestamp()
-    cached = _calendar_cache
-    if cached["fetched_at"] and (now - cached["fetched_at"]) < CALENDAR_CACHE_SECONDS:
-        return web.json_response({"events": cached["events"], "cached": True}, headers=CORS)
-    try:
-        cal_url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-            async with session.get(cal_url) as resp:
-                events = await resp.json(content_type=None)
-        _calendar_cache["events"] = events
-        _calendar_cache["fetched_at"] = now
-        return web.json_response({"events": events}, headers=CORS)
-    except Exception as e:
-        logger.warning(f"api_calendar error: {e}")
-        if cached["events"]:
-            return web.json_response({"events": cached["events"], "cached": True}, headers=CORS)
-        return web.json_response({"error": "no_data", "events": []}, status=503, headers=CORS)
-
-# ──────────────────────────────────────────────────────────────
-# RSS HELPERS
-# ──────────────────────────────────────────────────────────────
-async def fetch_rss_items(session: aiohttp.ClientSession, name: str, url: str, max_items: int = 5) -> list[dict]:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; VIPBot/2.0; +https://t.me/bot)",
-        "Accept": "application/rss+xml, application/xml, text/xml, */*",
-    }
-    try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                return []
-            raw = await resp.read()
-        root = ET.fromstring(raw)
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        items = []
-        for item in root.findall(".//item")[:max_items]:
-            title = item.findtext("title", "").strip()
-            link = item.findtext("link", "").strip()
-            date = item.findtext("pubDate", "").strip()
-            if title and link:
-                items.append({"title": title, "link": link, "pubDate": date, "source": name})
-        if not items:
-            for entry in root.findall(".//atom:entry", ns)[:max_items]:
-                title = entry.findtext("atom:title", "", ns).strip()
-                link_el = entry.find("atom:link", ns)
-                link = link_el.get("href", "") if link_el is not None else ""
-                date = entry.findtext("atom:updated", "", ns).strip()
-                if title and link:
-                    items.append({"title": title, "link": link, "pubDate": date, "source": name})
-        return items
-    except Exception:
-        return []
-
-async def refresh_news_cache() -> list[dict]:
-    now_ts = datetime.now(timezone.utc).timestamp()
-    if _news_cache["fetched_at"] and (now_ts - _news_cache["fetched_at"]) < NEWS_CACHE_SECONDS:
-        return _news_cache["items"]
-    async with aiohttp.ClientSession() as session:
-        tasks = [fetch_rss_items(session, name, url) for name, url, _ in RSS_SOURCES]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-    all_items = []
-    for res in results:
-        if isinstance(res, list):
-            all_items.extend(res)
-    if all_items:
-        _news_cache["items"] = all_items
-        _news_cache["fetched_at"] = now_ts
-    return _news_cache["items"]
-
 # ──────────────────────────────────────────────────────────────
 # SERVIDOR HTTP
 # ──────────────────────────────────────────────────────────────
@@ -240,10 +128,6 @@ async def start_api_server():
     app_http = web.Application()
     app_http.router.add_route("GET", "/api/user_info", api_user_info)
     app_http.router.add_route("OPTIONS", "/api/user_info", api_user_info)
-    app_http.router.add_route("GET", "/api/news", api_news)
-    app_http.router.add_route("OPTIONS", "/api/news", api_news)
-    app_http.router.add_route("GET", "/api/calendar", api_calendar)
-    app_http.router.add_route("OPTIONS", "/api/calendar", api_calendar)
     runner = web.AppRunner(app_http)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", API_PORT)
@@ -266,7 +150,9 @@ async def start_api_server():
     STATE_ADM_TICKET_REPLY,
     STATE_ADDDAYS_INPUT,
     STATE_KICK_MEMBER,
-) = range(12)  # Eliminados los estados de agregar/remover admin
+    STATE_ADMIN_ADD,
+    STATE_ADMIN_REMOVE,
+) = range(14)
 
 BROADCAST_FILTER = {}
 
@@ -702,7 +588,160 @@ async def adm_ticket_reopen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(f"🔄 *Ticket #{tid:04d} reabierto*", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
 
 # ──────────────────────────────────────────────────────────────
-# ADMIN - PANEL PRINCIPAL (simplificado)
+# ADMIN - GESTIÓN DE ADMINS
+# ──────────────────────────────────────────────────────────────
+async def adm_manage_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🛡️ *Gestión de Administradores*\n\n"
+        "Puedes agregar o quitar administradores.\n\n"
+        "⚠️ *Nota:* El admin principal (ID original) no puede ser removido.",
+        reply_markup=kb.admin_management_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def adm_add_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "➕ *Agregar administrador*\n\n"
+        "Envía el *user_id* del usuario que quieres agregar como admin.\n\n"
+        "Puedes obtener el ID enviando /id en el chat con el bot.\n\n"
+        "✏️ *Ejemplo:* `123456789`",
+        reply_markup=kb.cancel_keyboard(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return STATE_ADMIN_ADD
+
+async def adm_add_admin_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    try:
+        user_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ *ID inválido*\n\nDebe ser un número.", reply_markup=kb.admin_panel(), parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+    
+    if user_id == ADMIN_ID:
+        await update.message.reply_text("⚠️ *El admin principal ya tiene permisos*\n\nNo es necesario agregarlo.", reply_markup=kb.admin_panel(), parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+    
+    # Obtener info del usuario
+    try:
+        chat = await context.bot.get_chat(user_id)
+        username = chat.username or ""
+        first_name = chat.first_name or ""
+    except TelegramError:
+        username = ""
+        first_name = f"Usuario_{user_id}"
+    
+    await db.add_admin(user_id, username, first_name, update.effective_user.id)
+    await db.audit(update.effective_user.id, "add_admin", str(user_id), f"{first_name} @{username}")
+    
+    await update.message.reply_text(
+        f"✅ *Administrador agregado*\n\n"
+        f"👤 {first_name} (`{user_id}`)\n"
+        f"Ahora tiene acceso al panel de administración.",
+        reply_markup=kb.admin_panel(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    # Notificar al nuevo admin
+    await notify_user(context.bot, user_id, 
+        "🛡️ *Has sido agregado como administrador del bot VIP*\n\n"
+        "Ya puedes usar el comando /admin para acceder al panel de control.\n\n"
+        "_Si esto fue un error, contacta al administrador principal._",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    return ConversationHandler.END
+
+async def adm_remove_admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    q = update.callback_query
+    await q.answer()
+    
+    admins = await db.list_admins()
+    if not admins:
+        await q.edit_message_text(
+            "📭 *No hay administradores adicionales*\n\n"
+            "Solo existe el admin principal.",
+            reply_markup=kb.admin_back(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return ConversationHandler.END
+    
+    text = "➖ *Quitar administrador*\n\n"
+    text += "Envía el *user_id* del admin que quieres remover:\n\n"
+    text += "📋 *Admins actuales:*\n"
+    for a in admins:
+        text += f"• `{a['user_id']}` — {a['first_name'] or a['username'] or 'Sin nombre'}\n"
+    text += "\n✏️ *Ejemplo:* `123456789`"
+    
+    await q.edit_message_text(text, reply_markup=kb.cancel_keyboard(), parse_mode=ParseMode.MARKDOWN)
+    return STATE_ADMIN_REMOVE
+
+async def adm_remove_admin_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return ConversationHandler.END
+    try:
+        user_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ *ID inválido*\n\nDebe ser un número.", reply_markup=kb.admin_panel(), parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+    
+    if user_id == ADMIN_ID:
+        await update.message.reply_text("⚠️ *No puedes remover al admin principal*", reply_markup=kb.admin_panel(), parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+    
+    # Verificar si existe
+    admins = await db.get_all_admin_ids()
+    if user_id not in admins:
+        await update.message.reply_text(f"❌ *El usuario `{user_id}` no es administrador*", reply_markup=kb.admin_panel(), parse_mode=ParseMode.MARKDOWN)
+        return ConversationHandler.END
+    
+    await db.remove_admin(user_id)
+    await db.audit(update.effective_user.id, "remove_admin", str(user_id), "")
+    
+    await update.message.reply_text(
+        f"✅ *Administrador removido*\n\n"
+        f"Usuario `{user_id}` ya no tiene permisos de admin.",
+        reply_markup=kb.admin_panel(),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    # Notificar al removido
+    await notify_user(context.bot, user_id,
+        "⚠️ *Has sido removido como administrador del bot VIP*\n\n"
+        "Ya no tienes acceso al panel de administración.\n\n"
+        "_Si crees que esto fue un error, contacta al administrador principal._",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    return ConversationHandler.END
+
+async def adm_list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_user.id): return
+    q = update.callback_query
+    await q.answer()
+    
+    admins = await db.list_admins()
+    text = "🛡️ *Lista de Administradores*\n\n"
+    text += f"👑 *Admin principal:* `{ADMIN_ID}`\n\n"
+    
+    if admins:
+        text += "👥 *Admins adicionales:*\n"
+        for a in admins:
+            name = a['first_name'] or a['username'] or 'Sin nombre'
+            text += f"• `{a['user_id']}` — {name}\n"
+    else:
+        text += "📭 *No hay admins adicionales*"
+    
+    await q.edit_message_text(text, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
+
+# ──────────────────────────────────────────────────────────────
+# ADMIN - PANEL PRINCIPAL
 # ──────────────────────────────────────────────────────────────
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update.effective_user.id):
@@ -848,7 +887,7 @@ async def adm_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     s = await db.get_stats_summary()
-    txt = f"📊 *Estadísticas*\n\n👥 Total miembros: *{s['total']}*\n✅ Activos: *{s['active']}*\n🆕 Nuevos hoy: *{s['new_today']}*\n⚠️ Vencen en 3d: *{s['expiring_3d']}*\n🔑 Códigos activos: *{s['codes']}*\n🎟️ Tickets abiertos: *{s['tickets_open']}*\n🚫 Bloqueados: *{s['banned']}*\n🎁 Pruebas usadas: *{s['trials']}*"
+    txt = f"📊 *Estadísticas*\n\n👥 Total miembros: *{s['total']}*\n✅ Activos: *{s['active']}*\n🆕 Nuevos hoy: *{s['new_today']}*\n⚠️ Vencen en 3d: *{s['expiring_3d']}*\n🔑 Códigos activos: *{s['codes']}*\n🎟️ Tickets abiertos: *{s['tickets_open']}*\n🚫 Bloqueados: *{s['banned']}*\n🎁 Pruebas usadas: *{s['trials']}*\n👥 Admins: *{s['admins']}*"
     await q.edit_message_text(txt, reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
 
 async def adm_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -980,7 +1019,7 @@ async def adm_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer("💾 Generando backup...")
     try:
-        with open("vip_bot.db", "rb") as f:
+        with open(DB_PATH, "rb") as f:
             await context.bot.send_document(q.from_user.id, document=f, filename=f"backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db", caption="🗄️ Backup de base de datos")
         await q.edit_message_text("✅ *Backup enviado*", reply_markup=kb.admin_back(), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -1098,81 +1137,10 @@ async def job_warn_expiring(context: ContextTypes.DEFAULT_TYPE):
                 text = f"🚨 *¡ÚLTIMAS HORAS!*\n\nTu membresía vence en *menos de 1 hora*.\nRenueva ahora para no perder el acceso."
             await notify_user(context.bot, m["user_id"], text, reply_markup=kb.main_menu())
 
-async def job_calendar_alerts(context: ContextTypes.DEFAULT_TYPE):
-    global _alerted_events, _calendar_cache
-    now_ts = datetime.now(timezone.utc).timestamp()
-    if not _calendar_cache["fetched_at"] or (now_ts - _calendar_cache["fetched_at"]) > CALENDAR_CACHE_SECONDS:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json") as resp:
-                    events = await resp.json()
-            _calendar_cache["events"] = events
-            _calendar_cache["fetched_at"] = now_ts
-        except Exception as e:
-            logger.warning(f"Error calendario: {e}")
-            return
-    now = datetime.now(timezone.utc)
-    alert_window = now + timedelta(minutes=35)
-    upcoming = []
-    for ev in _calendar_cache.get("events", []):
-        if ev.get("impact", "").lower() != "high":
-            continue
-        try:
-            ev_dt = datetime.fromisoformat(ev["date"].replace("Z", "+00:00"))
-        except Exception:
-            continue
-        if now <= ev_dt <= alert_window:
-            ev_id = f"{ev.get('title')}_{ev_dt.strftime('%Y%m%d%H%M')}"
-            if ev_id not in _alerted_events:
-                upcoming.append((ev, ev_dt, ev_id))
-    if not upcoming:
-        return
-    members = await db.get_active_members()
-    if not members:
-        return
-    flags = {"USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵", "CAD": "🇨🇦", "AUD": "🇦🇺", "NZD": "🇳🇿", "CHF": "🇨🇭"}
-    for ev, ev_dt, ev_id in upcoming:
-        mins = int((ev_dt - now).total_seconds() / 60)
-        flag = flags.get(ev.get("country", ""), "🌐")
-        text = f"🔴 *ALERTA - ALTO IMPACTO*\n\n📌 *{ev.get('title')}*\n{flag} {ev.get('country')}  |  🕐 {ev_dt.strftime('%H:%M')} UTC\n⏱ En *{mins} minutos*\n\nPrepárate para alta volatilidad."
-        sent = 0
-        for m in members:
-            try:
-                await context.bot.send_message(m["user_id"], text, parse_mode=ParseMode.MARKDOWN)
-                sent += 1
-            except TelegramError:
-                pass
-        _alerted_events.add(ev_id)
-        logger.info(f"📢 Alerta: {ev.get('title')} → {sent} usuarios")
-
-async def job_crypto_news(context: ContextTypes.DEFAULT_TYPE):
-    global _seen_news_links
-    items = await refresh_news_cache()
-    if not items:
-        return
-    new_items = [it for it in items if it.get("link") and it["link"] not in _seen_news_links]
-    if not new_items:
-        return
-    for item in new_items[:3]:
-        title = item.get("title", "").strip()
-        link = item.get("link", "").strip()
-        source = item.get("source", "Crypto News")
-        if not title or not link:
-            continue
-        text = f"📰 *{title}*\n\n📡 {source}\n\n🔗 {link}"
-        try:
-            await context.bot.send_message(CHANNEL_ID, text, parse_mode=ParseMode.MARKDOWN)
-            _seen_news_links.add(link)
-            await asyncio.sleep(2)
-        except TelegramError as e:
-            logger.warning(f"Error publicando: {e}")
-    if len(_seen_news_links) > 200:
-        _seen_news_links = set(list(_seen_news_links)[-200:])
-
 async def job_daily_summary(context: ContextTypes.DEFAULT_TYPE):
     stats = await db.get_stats_summary()
     admin_ids = await db.get_all_admin_ids()
-    text = f"📊 *Resumen diario*\n\n👥 Activos: *{stats['active']}*\n📆 Nuevos hoy: *{stats['new_today']}*\n⚠️ Vencen pronto: *{stats['expiring_3d']}*\n🎟️ Tickets abiertos: *{stats['tickets_open']}*"
+    text = f"📊 *Resumen diario*\n\n👥 Activos: *{stats['active']}*\n📆 Nuevos hoy: *{stats['new_today']}*\n⚠️ Vencen pronto: *{stats['expiring_3d']}*\n🎟️ Tickets abiertos: *{stats['tickets_open']}*\n👥 Admins: *{stats['admins']}*"
     for aid in admin_ids:
         await notify_user(context.bot, aid, text)
 
@@ -1232,10 +1200,22 @@ def main():
                 fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
                 conversation_timeout=300
             ),
-            # Expulsar miembro
             ConversationHandler(
                 entry_points=[CallbackQueryHandler(adm_kick_member_start, pattern="^adm_kick_member$")],
                 states={STATE_KICK_MEMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_kick_member_received)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
+                conversation_timeout=300
+            ),
+            # Admin management conversations
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_add_admin_start, pattern="^adm_add_admin$")],
+                states={STATE_ADMIN_ADD: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_admin_received)]},
+                fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
+                conversation_timeout=300
+            ),
+            ConversationHandler(
+                entry_points=[CallbackQueryHandler(adm_remove_admin_start, pattern="^adm_remove_admin$")],
+                states={STATE_ADMIN_REMOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_remove_admin_received)]},
                 fallbacks=[CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$")],
                 conversation_timeout=300
             ),
@@ -1260,7 +1240,7 @@ def main():
         app.add_handler(CallbackQueryHandler(ticket_close_user, pattern="^ticket_close_"))
         app.add_handler(CallbackQueryHandler(ticket_reopen_user, pattern="^ticket_reopen_"))
 
-        # Callbacks de admin (con paginación)
+        # Callbacks de admin
         app.add_handler(CallbackQueryHandler(admin_panel_callback, pattern="^adm_panel$"))
         app.add_handler(CallbackQueryHandler(adm_list_codes, pattern="^adm_list_codes$"))
         app.add_handler(CallbackQueryHandler(adm_list_codes, pattern="^adm_list_codes_page_\\d+$"))
@@ -1279,16 +1259,17 @@ def main():
         app.add_handler(CallbackQueryHandler(adm_clean_expired, pattern="^adm_clean_expired$"))
         app.add_handler(CallbackQueryHandler(adm_export_csv, pattern="^adm_export_csv$"))
         app.add_handler(CallbackQueryHandler(adm_backup, pattern="^adm_backup$"))
+        # Admin management callbacks
+        app.add_handler(CallbackQueryHandler(adm_manage_admins, pattern="^adm_manage_admins$"))
+        app.add_handler(CallbackQueryHandler(adm_list_admins, pattern="^adm_list_admins$"))
 
         # Auto-respuesta
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, auto_reply))
 
-        # Jobs
+        # Jobs (sin calendar ni news)
         jq = app.job_queue
         jq.run_repeating(job_clean_expired, interval=3600, first=60)
         jq.run_repeating(job_warn_expiring, interval=43200, first=120)
-        jq.run_repeating(job_calendar_alerts, interval=900, first=30)
-        jq.run_repeating(job_crypto_news, interval=1800, first=90)
         jq.run_daily(job_daily_summary, time=datetime.strptime("08:00", "%H:%M").time())
 
         logger.info(f"🚀 Bot iniciado | Canal: {CHANNEL_ID}")
