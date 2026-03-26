@@ -30,15 +30,6 @@ def admin_panel() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👥 Miembros activos", callback_data="adm_members"), InlineKeyboardButton("📊 Estadísticas", callback_data="adm_stats")],
         [InlineKeyboardButton("🚫 Expulsar miembro", callback_data="adm_kick_member"), InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast")],
         [InlineKeyboardButton("🎟️ Tickets", callback_data="adm_tickets"), InlineKeyboardButton("🔧 Mantenimiento", callback_data="adm_maintenance")],
-        [InlineKeyboardButton("🛡️ Gestionar admins", callback_data="adm_manage_admins")],
-    ])
-
-def admin_management_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Agregar admin", callback_data="adm_add_admin")],
-        [InlineKeyboardButton("➖ Quitar admin", callback_data="adm_remove_admin")],
-        [InlineKeyboardButton("📋 Ver admins", callback_data="adm_list_admins")],
-        [InlineKeyboardButton("« Panel admin", callback_data="adm_panel")],
     ])
 
 def admin_back() -> InlineKeyboardMarkup:
